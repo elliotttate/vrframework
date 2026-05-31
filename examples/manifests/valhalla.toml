@@ -1,0 +1,39 @@
+# Layer-3 example: per-game offsets as DATA, not compiled code.
+# Replaces anvilengine2vr/games/valhalla/engine/memory/offsets.h. One engine binary +
+# this file = support for AC Valhalla; ship odyssey.toml / mirage.toml alongside.
+#
+# Loaded via memory::OffsetManifest::get().load("games/valhalla.toml"); each [hooks.*]
+# is resolved with scan-or-fallback (memory::FuncRelocation semantics).
+
+[engine]
+family = "anvil"
+exe    = "ACValhalla.exe"
+
+[hooks.begin_render_frame]
+pattern  = "40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? E8 ? ? ? ? 48 8B 0D"
+fallback = 0x10f4db0
+kind     = "func"
+
+[hooks.calc_projection]
+pattern  = "48 8B C4 53 48 81 EC 90 00 00 00 0F 29 70 E8 48 8B D9 F3"
+fallback = 0x817110
+kind     = "func"
+
+[hooks.calc_final_view]
+pattern  = "48 8B C4 53 55 56 57 41 54 41 55 41 56 41 57 48 81 EC D8 01"
+fallback = 0x8b8fc0
+kind     = "func"
+
+[hooks.on_begin_frame]
+pattern        = "E8 ? ? ? ? E8 ? ? ? ? B9 01 00 00 00 86 88 48 04 00 00"
+fallback       = 0x15e2810
+kind           = "instruction"
+offset_begin   = 1
+instruction_len = 5
+
+[globals.current_ui_ptr]
+pattern        = "48 8D 0D ? ? ? ? 48 8B D7 48 8B D8 E8 ? ? ? ? 48 8B CB E8 ? ? ? ? 83 05"
+fallback       = 0x62c1bc0
+kind           = "instruction"
+offset_begin   = 3
+instruction_len = 7
