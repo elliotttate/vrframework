@@ -46,4 +46,9 @@ unsigned long long buffers_tracked();
 unsigned long long cam_hits();
 unsigned long long cbv6912_count();
 
+// Live-tuning values from the control file (E:\tmp\fh5vr_ctl.txt): half-IPD in FH5 units and the
+// head-translation units-per-metre. apply_stereo reads these so IPD/scale can be swept without a rebuild.
+float ctl_half_ipd();
+float ctl_world_scale();
+
 } // namespace fh5cb

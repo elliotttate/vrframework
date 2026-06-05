@@ -293,26 +293,37 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     constexpr glm::mat4 B{ 1.0f,0.0f,0.0f,0.0f,  0.0f,1.0f,0.0f,0.0f,  0.0f,0.0f,-1.0f,0.0f,  0.0f,0.0f,0.0f,1.0f };
     const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Hrel) * glm::mat3(B);   // head rotation in engine axes
 
-    // a4 delta = rotation ONLY (no translation upstream — it cancels). Same for both eyes.
+    // a4 delta = rotation ONLY (no translation upstream — it cancels). Shared across eyes below.
     glm::mat4 Gfix{ R_eng };
     Gfix[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    std::memcpy(s.delta, &Gfix[0][0], 64);
     s.ipd_units = 0.0f;
     s.eye_idx = eye;
 
     // Head translation in engine REST-frame axes (B relabels OpenXR->engine; recenter aligned rest with the
-    // engine camera). FH5 world units ~cm (~100 units/metre), so scale by FH5_WorldScale.
-    const float ws = m_world_scale->value();
+    // engine camera). units/metre comes from the live control file (default 100) so it can be swept.
+    const float ws = fh5cb::ctl_world_scale();
     const glm::vec3 head_t = glm::mat3(B) * glm::vec3(Hrel[3]) * ws;   // (right, up, forward) in engine units
 
     // The downstream hook converts the offset through the CURRENT (head-rotated) camera axes. The IPD must
     // ride those rotated axes (lateral to where you look), but the head translation is in the REST frame, so
     // pre-rotate it by R_eng^T to cancel the producer's rotation -> it lands in the rest/engine frame.
     const glm::vec3 head_t_local = glm::transpose(R_eng) * head_t;
-    constexpr float FH5_HALF_IPD_UNITS = 3.15f;   // ~63mm IPD at ~100 units/metre (tune via FH5_IpdScale)
+
+    // SYMMETRIC stereo: share ONE head pose (rotation + translation) across both eyes, computed from the
+    // LEFT eye, so the ONLY per-eye difference is the symmetric ±IPD. Deriving the head pose per-eye from
+    // view[eye] leaks an asymmetric component (the eye-offset conjugation under head rotation, and any
+    // per-eye recenter drift) -> the eyes drifted to different positions. This forces them symmetric.
+    static glm::mat4 s_head_delta{ 1.0f }; static glm::vec3 s_head_off{ 0.0f }; static bool s_head_set = false;
+    if (view.current_render_eye == StereoView::Eye::LEFT || !s_head_set) {
+        s_head_delta = Gfix; s_head_off = head_t_local; s_head_set = true;
+    }
+    std::memcpy(s.delta, &s_head_delta[0][0], 64);   // shared rotation for the producer (both eyes identical)
+
+    // Half-IPD in FH5 units, LIVE from the control file (sweep 0, 0.032, 0.10, 3.15 to find the right scale
+    // without rebuilding). 0 -> both eyes identical (alignment baseline).
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    const float half_ipd = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
-    const glm::vec3 off = head_t_local + glm::vec3(half_ipd, 0.0f, 0.0f);
+    const float half_ipd = ipd_sign * fh5cb::ctl_half_ipd();
+    const glm::vec3 off = s_head_off + glm::vec3(half_ipd, 0.0f, 0.0f);   // shared head + symmetric per-eye IPD
     fh5cb::set_eye_offset(off.x, off.y, off.z, /*active=*/true);
 
     {   // ~1/s diagnostic: head delta + per-eye offset

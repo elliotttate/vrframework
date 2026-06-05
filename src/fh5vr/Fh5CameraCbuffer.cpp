@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,51 @@ namespace {
 // ---------------------------------------------------------------------------
 std::atomic<float> g_off_x{ 0.0f }, g_off_y{ 0.0f }, g_off_z{ 0.0f };
 std::atomic<bool>  g_active{ false };
+
+// ---------------------------------------------------------------------------
+// Live-tuning control file: E:\tmp\fh5vr_ctl.txt, polled by a worker thread, so
+// IPD / world-scale / transform-mode can be swept WITHOUT a rebuild (the audit's
+// Phase 0). Lines: "ipd=0.032" (half-IPD in FH5 units), "scale=100" (head-trans
+// units/metre), "mode=off|camrel|viewvp|all".
+// ---------------------------------------------------------------------------
+std::atomic<float> g_ctl_half_ipd{ 3.15f };
+std::atomic<float> g_ctl_world_scale{ 100.0f };
+std::atomic<int>   g_ctl_mode{ 3 };   // 0=off 1=camrel_only 2=view_vp_only 3=all
+std::atomic<bool>  g_ctl_started{ false };
+
+void poll_control_file() {
+    FILE* f = nullptr;
+    if (fopen_s(&f, "E:\\tmp\\fh5vr_ctl.txt", "rb") != 0 || f == nullptr) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        float v; int iv;
+        if (sscanf_s(line, "ipd=%f", &v) == 1)        g_ctl_half_ipd.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "scale=%f", &v) == 1) g_ctl_world_scale.store(v, std::memory_order_relaxed);
+        else if (strncmp(line, "mode=", 5) == 0) {
+            if      (strncmp(line + 5, "off", 3) == 0)    iv = 0;
+            else if (strncmp(line + 5, "camrel", 6) == 0) iv = 1;
+            else if (strncmp(line + 5, "viewvp", 6) == 0) iv = 2;
+            else                                          iv = 3;
+            g_ctl_mode.store(iv, std::memory_order_relaxed);
+        }
+    }
+    fclose(f);
+}
+
+DWORD WINAPI ControlThread(void*) {
+    int last_logged = -999;
+    for (;;) {
+        poll_control_file();
+        const int m = g_ctl_mode.load(std::memory_order_relaxed);
+        const int sig = m * 100000 + (int)(g_ctl_half_ipd.load(std::memory_order_relaxed) * 1000);
+        if (sig != last_logged) {
+            last_logged = sig;
+            spdlog::info("[FH5CTL] half_ipd={:.3f} scale={:.1f} mode={}",
+                         g_ctl_half_ipd.load(), g_ctl_world_scale.load(), m);
+        }
+        Sleep(300);
+    }
+}
 
 // ---- math (identical helpers to DxgiProxy.cpp) ----------------------------
 struct Mat4 { float m[16]; };
@@ -117,14 +163,21 @@ bool TransformStereo(uint8_t* p) {
     // the bug -- it had zero render effect because the convention was wrong.) The camera-relative geometry
     // fed to camRelVP is FIXED for the frame, so shifting the eye here does NOT cancel -> real parallax.
     Mat4 Tcol{ {1,0,0,-wdx,  0,1,0,-wdy,  0,0,1,-wdz,  0,0,0,1} };   // column-vector translate by -wd
-    Mat4 Vnew        = Mul(V, Tcol);   // VIEW    @ 0x000 (world->view)
-    Mat4 VPnew       = Mul(P, Tcol);   // VP      @ 0x040 (world->clip)
-    Mat4 camRelVPnew = Mul(R, Tcol);   // camRelVP@ 0x100 (camRel->clip)  -- the parallax lever
 
-    std::memcpy(p,         Vnew.m,        64);
-    std::memcpy(p + 64,    VPnew.m,       64);
-    std::memcpy(p + 256,   camRelVPnew.m, 64);
-    std::memcpy(p + 0xC40, camRelVPnew.m, 64);  // camRelVP exact duplicate @ 0xC40 (spec §1.2)
+    // Mode gate (live via the control file): isolate which field moves which surface.
+    const int mode = g_ctl_mode.load(std::memory_order_relaxed);
+    if (mode == 0) return false;                      // off
+    if (mode == 1 || mode == 3) {                     // camrel_only / all -> world parallax lever
+        Mat4 camRelVPnew = Mul(R, Tcol);
+        std::memcpy(p + 256,   camRelVPnew.m, 64);
+        std::memcpy(p + 0xC40, camRelVPnew.m, 64);    // camRelVP exact duplicate @ 0xC40 (spec §1.2)
+    }
+    if (mode == 2 || mode == 3) {                     // view_vp_only / all -> car/cockpit/world-space path
+        Mat4 Vnew  = Mul(V, Tcol);                    // VIEW @ 0x000 (world->view)
+        Mat4 VPnew = Mul(P, Tcol);                    // VP   @ 0x040 (world->clip)
+        std::memcpy(p,       Vnew.m,  64);
+        std::memcpy(p + 64,  VPnew.m, 64);
+    }
     return true;
 }
 
@@ -308,7 +361,13 @@ void set_eye_offset(float view_x, float view_y, float view_z, bool active) {
     g_off_y.store(view_y, std::memory_order_relaxed);
     g_off_z.store(view_z, std::memory_order_relaxed);
     g_active.store(active, std::memory_order_relaxed);
+    if (!g_ctl_started.exchange(true)) {   // start the live-tuning control-file poller once
+        if (HANDLE t = CreateThread(nullptr, 0, &ControlThread, nullptr, 0, nullptr)) CloseHandle(t);
+    }
 }
+
+float ctl_half_ipd()    { return g_ctl_half_ipd.load(std::memory_order_relaxed); }
+float ctl_world_scale() { return g_ctl_world_scale.load(std::memory_order_relaxed); }
 
 unsigned long long ring_writes()     { return g_ring_writes.load(std::memory_order_relaxed); }
 unsigned long long buffers_tracked() { return g_buf_count.load(std::memory_order_relaxed); }
