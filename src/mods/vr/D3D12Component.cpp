@@ -149,12 +149,13 @@ bool D3D12Component::on_frame(VR* vr) {
     // SpriteBatch blit here. Omitted in this scaffold; FH5's validated backbuffer is 8-bit.
     auto eye_texture = backbuffer.Get();
 
-    // AFR eye selection: use the eye the PRODUCER actually applied to the main camera this frame (stamped
-    // in Fh5Adapter), NOT an independent present counter. The engine can run ahead of the present-driven
-    // latch, so a counter-derived eye could mismatch the camera that was rendered -> both swapchains get
-    // the same image (the disparity=0 bug). g_fh5_applied_eye guarantees copied-eye == rendered-eye.
-    extern std::atomic<int> g_fh5_applied_eye;
-    const int applied_eye = g_fh5_applied_eye.load(std::memory_order_acquire);   // 0=LEFT, 1=RIGHT
+    // AFR eye selection. Use the VR per-present render eye (m_render_eye, advanced once per present in
+    // VR::on_post_present) — this is ALWAYS driven, including at menus. The adapter's g_fh5_applied_eye
+    // stamp is only set while the main camera is being injected (is_main), so keying the begin/end cadence
+    // off it stalls submission whenever the gameplay camera isn't active (blank SimXR at menus). At
+    // gameplay both agree (the producer applies the same per-present-latched eye), so this stays correct
+    // for stereo while restoring reliable submission everywhere.
+    const int applied_eye = (int)vr->get_current_render_eye();   // 0=LEFT, 1=RIGHT
 
     // Begin the XR frame on the LEFT eye (first of the pair) so both copies land in a begun frame.
     if (applied_eye == 0 && !vr->m_openxr->frame_began) {
