@@ -7,9 +7,11 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #include <wrl/client.h>
 #include <imgui.h>
@@ -76,8 +78,18 @@ public:
     bool hook_d3d11();
     bool hook_d3d12();
 
+    // Present/resize callbacks the D3D hooks dispatch into (the frame heartbeat).
+    void on_frame_d3d11();
+    void on_post_present_d3d11();
+    void on_frame_d3d12();
+    void on_post_present_d3d12();
+    void on_reset();
+
 private:
     bool initialize();
+    bool initialize_windows_message_hook();
+    bool first_frame_initialize();
+    void call_on_frame();
     void save_config();
     void consume_input();
     void draw_ui();
@@ -88,9 +100,27 @@ private:
     bool m_initialized{ false };
     std::atomic<bool> m_engine_ready{ false };  // set by the adapter (enable_engine_thread)
 
+    // Frame-driven init state machine (see guide 05 §2). The engine-ready gate replaces
+    // REFramework's m_game_data_initialized; the heavy m_*d3d_initialize machinery is
+    // trimmed to what the engine-neutral spine needs.
+    bool m_first_frame{ true };
+    bool m_first_initialize{ true };
+    bool m_first_frame_d3d_initialize{ true };
+    bool m_has_frame{ false };
+    bool m_created_default_cfg{ false };
+    bool m_message_hook_requested{ false };
+    std::atomic<bool> m_mods_fully_initialized{ false };
+    uint32_t m_frames_since_init{ 0 };
+
+    bool m_is_d3d11{ false };
+    bool m_is_d3d12{ false };
+
     bool m_draw_ui{ true };
     bool m_is_ui_focused{ false };
     bool m_wants_save_config{ false };
+
+    float m_accumulated_mouse_delta[2]{};
+    std::string m_error{};
 
     HWND m_wnd{ 0 };
     float m_mouse_delta[2]{};

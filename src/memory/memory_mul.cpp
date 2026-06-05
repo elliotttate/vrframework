@@ -12,13 +12,16 @@ uintptr_t module_base() {
 }
 
 size_t module_size() {
+    // Read SizeOfImage straight from the in-memory PE headers — avoids the psapi.h/Psapi.lib
+    // dependency GetModuleInformation would pull in.
     static size_t size = [] {
-        auto base = (HMODULE)module_base();
-        MODULEINFO mi{};
-        if (GetModuleInformation(GetCurrentProcess(), base, &mi, sizeof(mi))) {
-            return (size_t)mi.SizeOfImage;
-        }
-        return (size_t)0;
+        const auto base = module_base();
+        if (!base) return (size_t)0;
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return (size_t)0;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return (size_t)0;
+        return (size_t)nt->OptionalHeader.SizeOfImage;
     }();
     return size;
 }

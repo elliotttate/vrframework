@@ -1,6 +1,10 @@
 #include "hooks/D3D11Hook.hpp"
 
 // PORT FROM: REFramework/src/D3D11Hook.cpp — engine-agnostic, copy verbatim. STUB.
+//
+// PointerHook is only forward-declared in the header (to keep <safetyhook> out of it); the
+// unique_ptr<PointerHook> member needs the COMPLETE type wherever the destructor is instantiated.
+#include "utility/Hooks.hpp"
 
 D3D11Hook::~D3D11Hook() = default;
 

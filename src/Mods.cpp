@@ -1,20 +1,69 @@
+#include <spdlog/spdlog.h>
+
+#include "Framework.hpp"
 #include "Mods.hpp"
 
+// PORT FROM: REFramework/src/Mods.cpp — ITERATION LOGIC ONLY.
+//
 // NOTE: Mods::Mods() (which mods exist) is provided by the CONSUMING repo per game.
 // The core owns only the iteration/dispatch below. See PORTING.md and the ports'
-// ModConfig.cpp for the constructor.
+// ModConfig.cpp for the constructor, e.g.:
+//
+//   Mods::Mods() {
+//       m_mods.emplace_back(VRConfig::get());
+//       m_mods.emplace_back(VR::get());
+//       m_mods.emplace_back(EngineEntry::Get());   // <- the IEngineAdapter mod
+//   }
+
+// The config file name the core loads/saves through. (REFramework keyed this off
+// REFrameworkConfig::REFRAMEWORK_CONFIG_NAME; here it is a single engine-neutral name.)
+static constexpr const char* VRFRAMEWORK_CONFIG_NAME = "vrframework_config.txt";
 
 std::optional<std::string> Mods::on_initialize() const {
     for (const auto& mod : m_mods) {
-        if (auto e = mod->on_initialize()) return e;
+        spdlog::info("{:s}::on_initialize()", mod->get_name().data());
+
+        if (auto e = mod->on_initialize(); e != std::nullopt) {
+            spdlog::info("{:s}::on_initialize() has failed: {:s}", mod->get_name().data(), *e);
+            return e;
+        }
     }
+
+    utility::Config cfg{ (Framework::get_persistent_dir() / VRFRAMEWORK_CONFIG_NAME).string() };
+
+    for (const auto& mod : m_mods) {
+        spdlog::info("{:s}::on_config_load()", mod->get_name().data());
+        mod->on_config_load(cfg, true);
+    }
+
     return std::nullopt;
 }
 
 std::optional<std::string> Mods::on_initialize_d3d_thread() const {
+    utility::Config cfg{ (Framework::get_persistent_dir() / VRFRAMEWORK_CONFIG_NAME).string() };
+
+    // Load once up-front so values exist before device-thread init.
     for (const auto& mod : m_mods) {
-        if (auto e = mod->on_initialize_d3d_thread()) return e;
+        spdlog::info("{:s}::on_config_load()", mod->get_name().data());
+        mod->on_config_load(cfg, true);
     }
+
+    for (const auto& mod : m_mods) {
+        spdlog::info("{:s}::on_initialize_d3d_thread()", mod->get_name().data());
+
+        if (auto e = mod->on_initialize_d3d_thread(); e != std::nullopt) {
+            spdlog::info("{:s}::on_initialize_d3d_thread() has failed: {:s}", mod->get_name().data(), *e);
+            return e;
+        }
+    }
+
+    // Load again so mods that constructed options during init still pick up saved values
+    // (do NOT reset to defaults this time — preserve what was read above).
+    for (const auto& mod : m_mods) {
+        spdlog::info("{:s}::on_config_load()", mod->get_name().data());
+        mod->on_config_load(cfg, false);
+    }
+
     return std::nullopt;
 }
 

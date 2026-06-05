@@ -64,11 +64,24 @@ template <> std::optional<float> Config::get<float>(std::string_view key) const 
     try { return std::stof(*v); } catch (...) { return std::nullopt; }
 }
 
-template <> void Config::set<std::string>(std::string_view key, const std::string& value) { set(key, value); }
-template <> void Config::set<bool>(std::string_view key, const bool& value) { set(key, value ? "true" : "false"); }
-template <> void Config::set<int32_t>(std::string_view key, const int32_t& value) { set(key, std::to_string(value)); }
+// NOTE: each wraps the value in std::string_view so the call binds to the NON-template
+// set(string_view, string_view) overload. Passing a bare std::string/const char* would exact-match the
+// template set<T>(string_view, const T&) instead, instantiating set<std::string>/set<const char*>
+// (the latter has no definition -> LNK2019; the former would self-recurse).
+template <> void Config::set<std::string>(std::string_view key, const std::string& value) {
+    set(key, std::string_view{ value });
+}
+template <> void Config::set<bool>(std::string_view key, const bool& value) {
+    set(key, std::string_view{ value ? "true" : "false" });
+}
+template <> void Config::set<int32_t>(std::string_view key, const int32_t& value) {
+    const std::string s = std::to_string(value);
+    set(key, std::string_view{ s });
+}
 template <> void Config::set<float>(std::string_view key, const float& value) {
-    std::ostringstream ss; ss << value; set(key, ss.str());
+    std::ostringstream ss; ss << value;
+    const std::string s = ss.str();
+    set(key, std::string_view{ s });
 }
 
 } // namespace utility
