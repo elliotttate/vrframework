@@ -282,13 +282,32 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains(VR* vr) {
 
         XrSwapchainCreateInfo swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         swapchain_create_info.arraySize = 1;
-        // MUST be the _SRGB variant. FH5's backbuffer holds sRGB-ENCODED display data; we CopyResource the
-        // bits verbatim (UNORM<->UNORM_SRGB are the same TYPELESS family, so no conversion). The runtime
-        // compositor (SimXR: runtime.cpp ~L3159) builds the sampling SRV from THIS format and writes to an
-        // _SRGB preview RTV. With _SRGB here: SRV decodes sRGB->linear on sample, RTV re-encodes -> correct.
-        // With plain UNORM the raw sRGB bits are treated as linear then encoded AGAIN -> blue boost, pink
-        // reads as purple. (A real HMD compositor follows the same convention.)
-        swapchain_create_info.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        // Match the LIVE engine backbuffer format so CopyResource is valid (same TYPELESS family) and the
+        // compositor interprets the bits the same way the game's display does. FH5 renders GAMEPLAY in HDR
+        // R10G10B10A2 (format 24) and menus/showroom in R8G8B8A8 (28); a hardcoded 8-bit _SRGB swapchain
+        // mismatches the 10-bit HDR backbuffer -> wrong color (purple). For 8-bit sRGB-encoded display data
+        // we pick the _SRGB variant so the compositor's SRV decodes sRGB->linear correctly (SimXR L3159).
+        // (NOTE: R10G10B10A2 has no _SRGB DXGI variant; SimXR's preview can't sRGB-decode 10-bit, so its
+        // "O" window may still look off for HDR gameplay even though the swapchain content + a real HMD
+        // compositor are correct. Full fix would tonemap/convert HDR->8bit sRGB in the copy shader.)
+        DXGI_FORMAT bb_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        {
+            ComPtr<ID3D12Resource> bb{};
+            if (SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&bb))) && bb != nullptr) {
+                bb_fmt = bb->GetDesc().Format;
+            }
+        }
+        DXGI_FORMAT xr_fmt;
+        switch (bb_fmt) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:  xr_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; break;
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:  xr_fmt = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; break;
+            case DXGI_FORMAT_R10G10B10A2_UNORM:    xr_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   break;  // HDR gameplay
+            default:                               xr_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; break;
+        }
+        swapchain_create_info.format = xr_fmt;
+        spdlog::info("[VR] eye swapchain format {} (backbuffer {})", (int)xr_fmt, (int)bb_fmt);
         swapchain_create_info.width = width;
         swapchain_create_info.height = height;
         swapchain_create_info.mipCount = 1;
