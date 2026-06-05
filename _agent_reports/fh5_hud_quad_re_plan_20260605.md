@@ -15,6 +15,114 @@ FH5 does not look like the REFramework/Scaleform path where we can hook a movie 
 
 So the practical route is draw/pass separation, not movie-viewport reprojection: identify the D3D12 HUD render pass, capture or redirect it into a transparent HUD texture, and submit that texture as an OpenXR quad layer.
 
+## Offline RE findings added 2026-06-05
+
+Status: the static RE pass is complete enough to choose hook families and avoid the dead ends. Exact flat-HUD draw EIDs, alpha behavior, and the final duplicate-HUD suppression point are still capture-only because the offline exports do not contain command-list event order or RTV lifetime.
+
+### UI stack identity
+
+FH5 is using a native ForzaTech AVUI/page/scene stack, not a middleware movie UI path.
+
+- Base class registration exists for `UIPage`: `E:\ForzaHorizon5_IDA_Decompile\pseudocode\fh5_000004.c:2013` / `:2026`.
+- Base class allocation/register evidence exists for `UIScene`: `E:\ForzaHorizon5_IDA_Decompile\pseudocode\fh5_000008.c:893`.
+- Page factories are built around `AVUI::TRefCountedPtr<UIPage>` and `SceneEntryData const &`: examples in `fh5_000296.c:4194`, `:4223`, `:4260`, `:4306`, `:4337`, `:4355`, and many more.
+- UI key/input handlers are explicitly `bool, UIPage::KeyArgs`: examples in `fh5_000296.c:4213`, `:4250`, and `:4287`.
+- Element callbacks use `AVUI::FrameworkElement *`: examples in `fh5_000296.c:4494` and `:7526`.
+- A transition enum/string is registered as `UISceneTransition`: `E:\ForzaHorizon5_IDA_Decompile\agent_inputpath\cmd_decompiles\cand_sub_140262E70.c:238`.
+
+Conclusion: page/scene hooks are useful for state classification and menu handling, but they are not the right place to extract the final rendered HUD texture.
+
+### Concrete UI and HUD anchors
+
+| Area | Anchor | Evidence | Use |
+| --- | --- | --- | --- |
+| Base UI page | `UIPage` registration around `0x14004B1C0` | `fh5_000004.c:2013`, `:2026` | Finds common page registration and page-factory patterns. |
+| Base UI scene | `UIScene` allocation/register path around `0x1400C3660` | `fh5_000008.c:893` | Finds common scene map and scene active-state paths. |
+| Copter HUD page | `nps_register_ui_page_UIPageCopterHud` at `0x14030DF20` | `agent_forcecam\log_names.txt:197`, `names.json:1496` | Known concrete HUD page for registration pattern matching. |
+| Copter HUD scene | `nps_register_ui_scene_CopterHud` at `0x14033EAC0` | `agent_forcecam\log_names.txt:201`, `names.json:1512` | Known concrete HUD scene for scene map validation. |
+| Gameplay minimap | `PlayerMinimapViewComponent` registration around `0x14016E5D0` | `fh5_000015.c:10684`, `:10699`; `camera_trace_summary.md:240` | High-value gameplay HUD component and minimap update source. |
+| Speedometer panel | `HUDSpeedometerComponent` registration around `0x140181220` | `fh5_000016.c:5140`, `:5155` | High-value speedometer state source. |
+| Speedometer provider | `HUDStatusSpeedometerProviderComponent` around `0x140231F90` | `fh5_000023.c:20016`, `:20031` | Status feed into the HUD system. |
+| HUD prioritizer | `HUDStatusPrioritiserModule` around `0x1401162C0` | `fh5_000012.c:2226`, `:2241` | Candidate for deciding active HUD/status composition. |
+| Active inner HUD state | `InnerHudStatusActive` | `fh5_000012.c:16768` | Candidate live state flag/string for "gameplay HUD is active". |
+| Notifications/popups | `TextHUDStatus`, `Notifications`, `NetworkProgressHudComponent` | `fh5_000021.c:873`, `fh5_000343.c:10409`, `fh5_000353.c:10004` | Useful for popup/menu classification and avoiding missing transient HUD. |
+
+### HUD status and page-state path
+
+`HUDStatus` is the strongest static signal for classification. Concrete UI panels bind `AVUI::TRefCountedPtr<HUDStatus>`:
+
+- `CopterHud` binds `AVUI::TRefCountedPtr<HUDStatus>` in `fh5_000332.c:192`, `:5616`, and type descriptor `:6449`.
+- `LimitedHud` binds `AVUI::TRefCountedPtr<HUDStatus>` in `fh5_000342.c:5546`, `:11592`, and type descriptor `:12462`.
+- `Notifications` binds `AVUI::TRefCountedPtr<HUDStatus>` in `fh5_000343.c:10409`, `:16724`, and `fh5_000344.c:391`.
+- `NetworkProgressHudComponent` binds `AVUI::TRefCountedPtr<HUDStatus>` and popup invite status in `fh5_000353.c:10004`, `fh5_000354.c:668`, `:687`, `:1897`, and `:1905`.
+
+Use this family to decide which HUD mode is active: gameplay HUD, limited HUD, popup/notification, pause/fullscreen menu, map, or copter/photo-style HUD. Do not use it as the final render extraction point. It describes UI state, not the final D3D12 texture.
+
+### Render-facing resource path
+
+The static render-binding names point at two likely UI draw families:
+
+| Render family | Evidence | Notes |
+| --- | --- | --- |
+| `ResourceBinding::OverlayRendererPSParameters` | `fh5_000002.c:13860`; ref-count object in `fh5_000066.c:20678` | Pixel-side overlay bindings. Likely relevant to flat UI/HUD draw PSOs. |
+| `ResourceBinding::OverlayRendererVSParameters` | `fh5_000002.c:13876`; ref-count object in `fh5_000066.c:20689` | Vertex-side overlay bindings. |
+| `ResourceBinding::OverlayRendererSamplerParameters` | `fh5_000002.c:13868`; ref-count object in `fh5_000086.c:15517` | Sampler state family for overlay draws. |
+| `ResourceBinding::PrimRendererPixelParameters` | `fh5_000002.c:14169`; ref-count object in `fh5_000074.c:22875` | Primitive UI renderer pixel bindings. |
+| `ResourceBinding::PrimRendererVertexParameters` | `fh5_000002.c:14161`; ref-count object in `fh5_000074.c:22897` | Primitive UI renderer vertex bindings. |
+| `Tide::TideUITextures` / `RowReference_TideUITextures` | `fh5_000031.c:2878`, `:2913`; row-reference helpers in `fh5_000394.c:7074` through `:7279` | Texture database path for UI resources. |
+| `Cms::UITextureData` | `fh5_000033.c:19144`; ref-counts in `fh5_000424.c:12699`, `fh5_000425.c:18407`, `:18435` | UI texture data wrapper. |
+
+These are the best static breadcrumbs for RenderDoc/resource matching. The actual hook should be validated at draw/PSO/RTV level after a capture. The render-binding names alone are not sufficient to skip or redirect draws because the same renderer family can be used by gameplay HUD, menu UI, and possibly non-HUD overlays.
+
+### Asset evidence for RenderDoc labeling
+
+The UI media tree gives names to search for when identifying SRVs/resources:
+
+- `media\UI\Effects.zip`: `NormalEffect.bin.dx12`, `SRGBShader.bin.dx12`, `TintShader.bin.dx12`, `SaturationShader.bin.dx12`, `CircularProgress.bin.dx12`, `TextureMaskEffect.bin.dx12`, plus DX11 variants.
+- `media\UI\Fonts.zip`: native `.vfont` assets such as `DG1_ArialBold.vfont`, `DG2_LCD-BOLD.vfont`, and `Horizon_*.vfont`.
+- `media\UI\Textures\HiRes\Data_Bound\HUD.zip`: `HUD_HorizonLine.swatchbin`, `HUD_Reticle.swatchbin`, `HUD_Reticle_Glow.swatchbin`, `accolades_tick.swatchbin`, and notification assets.
+- `media\UI\Textures\HiRes\Data_Bound\Horizon_Map.zip`: map filter/icon swatch assets under `filters/default/...` and `icons/...`.
+
+Use these names to label SRVs and to separate flat HUD/minimap/menu resources from world-space route-line or chevron resources.
+
+### Debug and suppression knobs
+
+Static config/string evidence found in `E:\ForzaHorizon5_IDA_Decompile\agent_headtrack\dev_gate_dec.txt` and `dev_decompiles.txt`:
+
+| Knob | Evidence | Use |
+| --- | --- | --- |
+| `nohud` | `dev_gate_dec.txt:143`, `dev_decompiles.txt:3316` | Live debug toggle candidate to prove HUD draw range or suppress duplicate HUD during testing. |
+| `fastuirender` | `dev_gate_dec.txt:252`, `dev_decompiles.txt:3425` | UI renderer behavior/perf toggle. Useful for state discovery, not a final VR feature. |
+| `fasthud` | `dev_gate_dec.txt:253`, `dev_decompiles.txt:3426` | HUD renderer behavior/perf toggle. Useful for discovery. |
+| `uiscenegraphdebug` | `dev_gate_dec.txt:360`, `dev_decompiles.txt:3533` | Possible page/scene graph debug path. |
+| `zoomoutminimap` | `dev_gate_dec.txt:362`, `dev_decompiles.txt:3535` | Minimap behavior/debug path. |
+| `HideAllOverlays` | `dev_gate_dec.txt:496`, `dev_decompiles.txt:3669` | Strong suppression/debug candidate. Do not assume it only affects HUD until captured. |
+| `Options/HUDSafeFrameHorizontal` | `dev_gate_dec.txt:2074`, `dev_decompiles.txt:1963` | Desktop safe-frame fallback or debug shrink/recenter path. |
+| `Options/HUDSafeFrameVertical` | `dev_gate_dec.txt:2080`, `dev_decompiles.txt:1969` | Desktop safe-frame fallback or debug shrink/recenter path. |
+| `Options/HideInactiveMouseOnHUD` | `dev_gate_dec.txt:2086`, `dev_decompiles.txt:1975` | Cursor/HUD interaction clue for future quad pointer mapping. |
+
+These are probe aids, not the primary architecture. The final VR path should copy or redirect the actual HUD render output to a quad and prevent the baked HUD from landing in the projection layer.
+
+### Hook priority from the offline RE
+
+1. **State/classification hook:** page/scene/HUD-status family. Use this to decide whether the current frame is gameplay HUD, popup, menu, map, copter/photo, or no HUD.
+2. **Render extraction hook:** D3D12 draw/PSO/resource boundary for `OverlayRenderer*`, `PrimRenderer*`, `TideUITextures`, or `UITextureData` consumers once RenderDoc identifies the exact flat-HUD events.
+3. **Suppression hook:** if FH5 uses a separate UI RT, skip or block only the final UI composite after copying it to the HUD quad. If FH5 draws HUD directly to the final backbuffer, redirect the identified HUD draws into our own transparent target or capture a clean world image before HUD begins.
+4. **Debug hook:** `HideAllOverlays` / `nohud` / safe-frame options. Use to validate assumptions and reduce duplicate HUD while testing, but avoid shipping a broad overlay kill unless capture proves it is scoped.
+
+### What cannot be completed offline
+
+The following items require a RenderDoc frame or a live proxy/capture log:
+
+- exact flat-HUD EIDs and PSO IDs for speedometer, minimap, prompt text, and menu UI;
+- whether flat HUD draws into a separate alpha-preserving UI RT or directly into the final opaque backbuffer;
+- whether `HideAllOverlays`/`nohud` suppress only HUD or also useful non-HUD overlays;
+- the draw order boundary for "world complete, HUD begins";
+- final duplicate-HUD removal point;
+- color/HDR/gamma behavior of the copied HUD texture on an OpenXR quad.
+
+That is now the hard boundary: static RE can tell us where to classify UI state and which renderer families to inspect, but the actual quad texture source must be chosen from capture evidence.
+
 ## What we already know from previous captures
 
 The existing RenderDoc audit has not identified exact flat-HUD draw EIDs or PSOs yet. It did prove a useful separation:

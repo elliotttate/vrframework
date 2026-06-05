@@ -51,4 +51,12 @@ unsigned long long cbv6912_count();
 float ctl_half_ipd();
 float ctl_world_scale();
 
+// UPSTREAM camera-translation test (constant camera-relative offset applied in the producer hook to find
+// which argument is the real camera-position lever, with shadows/derived data following). tgt: 0=off,
+// 1=a4.row3, 2=a17, 3=a18, 4=all. fwd/strafe/up are camera-relative FH5 units.
+float ctl_up_fwd();
+float ctl_up_strafe();
+float ctl_up_up();
+int   ctl_up_tgt();
+
 } // namespace fh5cb

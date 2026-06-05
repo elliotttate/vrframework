@@ -43,20 +43,37 @@ std::atomic<float> g_ctl_world_scale{ 100.0f };
 std::atomic<int>   g_ctl_mode{ 3 };   // 0=off 1=camrel_only 2=view_vp_only 3=all
 std::atomic<bool>  g_ctl_started{ false };
 
+// UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
+// argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
+std::atomic<float> g_ctl_fwd{ 0.0f }, g_ctl_strafe{ 0.0f }, g_ctl_up{ 0.0f };
+std::atomic<int>   g_ctl_tgt{ 0 };    // 0=off 1=a4.row3 2=a17 3=a18 4=all
+
 void poll_control_file() {
     FILE* f = nullptr;
     if (fopen_s(&f, "E:\\tmp\\fh5vr_ctl.txt", "rb") != 0 || f == nullptr) return;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         float v; int iv;
-        if (sscanf_s(line, "ipd=%f", &v) == 1)        g_ctl_half_ipd.store(v, std::memory_order_relaxed);
-        else if (sscanf_s(line, "scale=%f", &v) == 1) g_ctl_world_scale.store(v, std::memory_order_relaxed);
+        if (sscanf_s(line, "ipd=%f", &v) == 1)          g_ctl_half_ipd.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "scale=%f", &v) == 1)   g_ctl_world_scale.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "fwd=%f", &v) == 1)     g_ctl_fwd.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "strafe=%f", &v) == 1)  g_ctl_strafe.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "up=%f", &v) == 1)      g_ctl_up.store(v, std::memory_order_relaxed);
         else if (strncmp(line, "mode=", 5) == 0) {
             if      (strncmp(line + 5, "off", 3) == 0)    iv = 0;
             else if (strncmp(line + 5, "camrel", 6) == 0) iv = 1;
             else if (strncmp(line + 5, "viewvp", 6) == 0) iv = 2;
             else                                          iv = 3;
             g_ctl_mode.store(iv, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "tgt=", 4) == 0) {
+            if      (strncmp(line + 4, "off", 3)    == 0) iv = 0;
+            else if (strncmp(line + 4, "a4",  2)    == 0) iv = 1;
+            else if (strncmp(line + 4, "a17", 3)    == 0) iv = 2;
+            else if (strncmp(line + 4, "a18", 3)    == 0) iv = 3;
+            else if (strncmp(line + 4, "driver", 6) == 0) iv = 5;   // CCamDriver+0x320 (upstream pose)
+            else                                          iv = 4;   // all
+            g_ctl_tgt.store(iv, std::memory_order_relaxed);
         }
     }
     fclose(f);
@@ -67,11 +84,15 @@ DWORD WINAPI ControlThread(void*) {
     for (;;) {
         poll_control_file();
         const int m = g_ctl_mode.load(std::memory_order_relaxed);
-        const int sig = m * 100000 + (int)(g_ctl_half_ipd.load(std::memory_order_relaxed) * 1000);
+        const int tgt = g_ctl_tgt.load(std::memory_order_relaxed);
+        const int sig = m * 100000 + tgt * 10000
+            + (int)(g_ctl_half_ipd.load(std::memory_order_relaxed) * 100)
+            + (int)(g_ctl_fwd.load(std::memory_order_relaxed) + g_ctl_strafe.load(std::memory_order_relaxed));
         if (sig != last_logged) {
             last_logged = sig;
-            spdlog::info("[FH5CTL] half_ipd={:.3f} scale={:.1f} mode={}",
-                         g_ctl_half_ipd.load(), g_ctl_world_scale.load(), m);
+            spdlog::info("[FH5CTL] ipd={:.3f} scale={:.1f} mode={} | UPSTREAM tgt={} fwd={:.1f} strafe={:.1f} up={:.1f}",
+                         g_ctl_half_ipd.load(), g_ctl_world_scale.load(), m, tgt,
+                         g_ctl_fwd.load(), g_ctl_strafe.load(), g_ctl_up.load());
         }
         Sleep(300);
     }
@@ -368,6 +389,10 @@ void set_eye_offset(float view_x, float view_y, float view_z, bool active) {
 
 float ctl_half_ipd()    { return g_ctl_half_ipd.load(std::memory_order_relaxed); }
 float ctl_world_scale() { return g_ctl_world_scale.load(std::memory_order_relaxed); }
+float ctl_up_fwd()      { return g_ctl_fwd.load(std::memory_order_relaxed); }
+float ctl_up_strafe()   { return g_ctl_strafe.load(std::memory_order_relaxed); }
+float ctl_up_up()       { return g_ctl_up.load(std::memory_order_relaxed); }
+int   ctl_up_tgt()      { return g_ctl_tgt.load(std::memory_order_relaxed); }
 
 unsigned long long ring_writes()     { return g_ring_writes.load(std::memory_order_relaxed); }
 unsigned long long buffers_tracked() { return g_buf_count.load(std::memory_order_relaxed); }
