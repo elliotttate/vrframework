@@ -268,75 +268,58 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     StereoState s{};
     s.active = true;
 
-    // IMPORTANT: StereoView::view[eye] is LABELED world->view but the core actually fills it with the
-    // camera-to-world POSE (rotation_offset * hmd * eye_to_head) — see offline movement report. So it is
-    // ALREADY the eye-to-local transform; inverting it (as before) flipped translation and bled axes.
-    // Use it directly.
-    const glm::mat4 G = view.view[eye];
+    // DECOUPLED stereo (fixes "left eye at a different angle" + 6-DOF translation):
+    //   * HEAD ROTATION  — derived from the single HMD pose (hmd_transform), so BOTH eyes get the SAME
+    //                      orientation. Applied to a4 in the producer (culling-correct). Using the per-eye
+    //                      view[eye] before baked the eye offset + any per-eye canting into a4 -> the eyes
+    //                      ended up at different angles. The IPD is a pure lateral offset, NOT a rotation.
+    //   * HEAD TRANSLATION + per-eye IPD — applied DOWNSTREAM in view space (Fh5CameraCbuffer), because
+    //                      a4.row3 (world camera position) cancels under FH5's camera-relative rendering.
+    //
+    // Tracking source = view[eye], NOT hmd_transform: SimXR's xrLocateSpace(view,local) does NOT track head
+    // TRANSLATION (stays 0), but xrLocateViews (which fills view[eye]) does. The PER-EYE recenter below
+    // subtracts the constant eye offset, so Hrel is the pure head delta (rotation + translation) and is the
+    // SAME for both eyes (eye_to_head has no rotation) — that's what keeps the two eyes at the same angle.
+    const glm::mat4 H = view.view[eye];
 
-    // Diagnostic (~1/s): pose vs inverse translation so we can confirm which tracks head motion correctly.
-    {
-        static std::atomic<uint32_t> dcount{ 0 };
-        if ((dcount.fetch_add(1, std::memory_order_relaxed) % 90) == 0) {
-            const glm::vec3 pose_t = glm::vec3(view.view[eye][3]);
-            const glm::vec3 inv_t  = glm::vec3(glm::affineInverse(view.view[eye])[3]);
-            const glm::vec3 hmd_t  = glm::vec3(view.hmd_transform[3]);
-            spdlog::info("[FH5POSE] eye={} poseT=[{:.3f} {:.3f} {:.3f}] invT=[{:.3f} {:.3f} {:.3f}] hmdT=[{:.3f} {:.3f} {:.3f}]",
-                eye, pose_t.x, pose_t.y, pose_t.z, inv_t.x, inv_t.y, inv_t.z, hmd_t.x, hmd_t.y, hmd_t.z);
-        }
-    }
-
-    // Recenter against the first frame so the unmoved head -> identity delta (set_head_pose seats the
-    // head at y=1.7; without this the camera would be lifted/displaced at rest). Grel rides BOTH the
-    // rotation and the translation of the head's motion together, so there is no euler axis bleed.
+    // Recenter against this eye's first-frame rest pose so the unmoved head -> identity AND the constant eye
+    // offset cancels. (set_head_pose seats the head at y=1.7; recentering keeps the camera at the engine's
+    // normal position at rest.) The explicit IPD below is the ONLY per-eye difference.
     static glm::mat4 s_rest[2]; static bool s_rest_set[2]{ false, false };
-    if (!s_rest_set[eye]) { s_rest[eye] = G; s_rest_set[eye] = true; }
-    glm::mat4 Grel = glm::affineInverse(s_rest[eye]) * G;
+    if (!s_rest_set[eye]) { s_rest[eye] = H; s_rest_set[eye] = true; }
+    const glm::mat4 Hrel = glm::affineInverse(s_rest[eye]) * H;
 
-    // --- Coordinate-basis fix (derived + numerically verified) -----------------------------------
-    // OpenXR is (x-right, y-up, -z-forward); FH5's a4 local frame (per the proven freecam BuildA) is
-    // (x-right, y-up, +z-forward). The change of basis is B = diag(1,1,-1) (negate forward). B is its
-    // own inverse. Conjugating the head rotation by B maps head pitch->camera pitch(r0), yaw->yaw(r1),
-    // roll->roll(r2); rotating translation by B maps right/up/forward correctly. We also SPLIT rotation
-    // (applied about the head) from translation (recentered, re-added separately) so SimXR's floor-pivot
-    // pitch does not swing the camera.
+    // Basis B = diag(1,1,-1): OpenXR (-z fwd) -> FH5 a4 (+z fwd). Conjugate the head rotation by B.
     constexpr glm::mat4 B{ 1.0f,0.0f,0.0f,0.0f,  0.0f,1.0f,0.0f,0.0f,  0.0f,0.0f,-1.0f,0.0f,  0.0f,0.0f,0.0f,1.0f };
-    const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Grel) * glm::mat3(B);   // B^-1 * R * B
+    const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Hrel) * glm::mat3(B);   // head rotation in engine axes
 
-    // Head translation: recenter delta scaled to FH5 world units. FH5 world units are ~cm (the proven
-    // freecam needed ~120 units to exit a ~1.2m cockpit -> ~100 units/metre), so FH5_WorldScale converts
-    // OpenXR metres -> FH5 units (default ~100). This is why head translation barely moved at ws=1.0.
-    const float ws = m_world_scale->value();
-    glm::vec3 t_eng = glm::mat3(B) * glm::vec3(Grel[3]) * ws;   // head translation in engine-local axes
-
+    // a4 delta = rotation ONLY (no translation upstream — it cancels). Same for both eyes.
     glm::mat4 Gfix{ R_eng };
-    Gfix[3] = glm::vec4(t_eng, 1.0f);
-
-    // Store raw column-major floats: this IS the row-vector delta for Mul(delta, a4) (column-major memory
-    // == row-major transpose == row-vector form; the translation lands at [12..14] = FH5's a4.row3).
+    Gfix[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
     std::memcpy(s.delta, &Gfix[0][0], 64);
-
-    // Per-eye IPD is applied DOWNSTREAM now, not here. Upstream a4.row3 (world camera position) cancels
-    // under FH5's camera-relative rendering (proven live: ±40-unit IPD -> 0 disparity), so the producer no
-    // longer does the lateral shift. The real stereo lever is the view-space shift on the camera-relative
-    // VP in Fh5CameraCbuffer.cpp; we publish the per-eye VIEW-SPACE offset for it below. Keep the producer
-    // ipd write disabled (0) so it does not pointlessly perturb a4.row3.
-    constexpr float FH5_HALF_IPD_UNITS = 10.0f;   // detectable baseline while validating; dial to ~3.15 (63mm @ 100u/m) once stereo confirmed
-    const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    s.ipd_units = 0.0f;   // producer IPD off (cancels); downstream cbuffer applies the real shift
+    s.ipd_units = 0.0f;
     s.eye_idx = eye;
 
-    // Publish the per-eye VIEW-SPACE camera offset for the downstream camera-cbuffer hook. For now this is
-    // IPD-only (lateral, +x = view-right); 6-DOF head translation will be folded in here once stereo is
-    // confirmed (it has the same cancellation issue upstream and the same view-space fix here).
+    // Head translation in engine REST-frame axes (B relabels OpenXR->engine; recenter aligned rest with the
+    // engine camera). FH5 world units ~cm (~100 units/metre), so scale by FH5_WorldScale.
+    const float ws = m_world_scale->value();
+    const glm::vec3 head_t = glm::mat3(B) * glm::vec3(Hrel[3]) * ws;   // (right, up, forward) in engine units
+
+    // The downstream hook converts the offset through the CURRENT (head-rotated) camera axes. The IPD must
+    // ride those rotated axes (lateral to where you look), but the head translation is in the REST frame, so
+    // pre-rotate it by R_eng^T to cancel the producer's rotation -> it lands in the rest/engine frame.
+    const glm::vec3 head_t_local = glm::transpose(R_eng) * head_t;
+    constexpr float FH5_HALF_IPD_UNITS = 3.15f;   // ~63mm IPD at ~100 units/metre (tune via FH5_IpdScale)
+    const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
     const float half_ipd = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
-    fh5cb::set_eye_offset(half_ipd, 0.0f, 0.0f, /*active=*/true);
-    // Diagnostic: confirm the per-eye offset alternates sign (eye0=-, eye1=+) reaching the cbuffer hook.
-    {
-        static std::atomic<int> s_last_eye{ -1 };
-        if (eye != s_last_eye.load(std::memory_order_relaxed)) {
-            s_last_eye.store(eye, std::memory_order_relaxed);
-            spdlog::info("[FH5IPD] eye={} half_ipd={:.2f} (offset published to cbuffer hook)", eye, half_ipd);
+    const glm::vec3 off = head_t_local + glm::vec3(half_ipd, 0.0f, 0.0f);
+    fh5cb::set_eye_offset(off.x, off.y, off.z, /*active=*/true);
+
+    {   // ~1/s diagnostic: head delta + per-eye offset
+        static std::atomic<uint32_t> dcount{ 0 };
+        if ((dcount.fetch_add(1, std::memory_order_relaxed) % 90) == 0) {
+            spdlog::info("[FH5POSE] eye={} headT(units)=[{:.2f} {:.2f} {:.2f}] off=[{:.2f} {:.2f} {:.2f}] halfIPD={:.2f}",
+                eye, head_t.x, head_t.y, head_t.z, off.x, off.y, off.z, half_ipd);
         }
     }
 
