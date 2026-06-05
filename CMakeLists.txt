@@ -153,8 +153,10 @@ target_compile_definitions(vrframework PUBLIC
     # <openxr/openxr.h> emits PFN typedefs only; the loader is dynamic-loaded and dispatched through
     # the global xr* pointers in OpenXRDispatch.{hpp,cpp}. Must be consistent across every TU.
     XR_NO_PROTOTYPES
-    # Define SIGNATURE_SCAN to pattern-scan at runtime instead of trusting manifest
-    # fallback offsets (see memory/memory_mul.h).
+    # Pattern-scan the producer AOB at runtime (and warn if it disagrees with the fallback
+    # offset) instead of blindly trusting RVA 0xBB1EE0 — robust to ASLR/build drift. The probe
+    # always scanned; match that. See memory/memory_mul.h FuncRelocation.
+    SIGNATURE_SCAN
 )
 
 # ---------------------------------------------------------------------------

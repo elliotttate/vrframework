@@ -247,31 +247,12 @@ bool D3D12Hook::hook() {
         return false;
     }
 
-    // Detect DLSS-FG / FSR3 frame-generation interposers via RTTI on the swapchain class name.
-    try {
-        std::string_view swapchain_classname = "unknown";
-        if (auto* obj = reinterpret_cast<void**>(swap_chain1); obj != nullptr) {
-            // best-effort typeid; if RTTI is unavailable this stays "unknown"
-            const std::type_info& ti = typeid(*reinterpret_cast<IUnknown*>(swap_chain1));
-            if (ti.name() != nullptr) {
-                swapchain_classname = ti.name();
-            }
-        }
-
-        spdlog::info("Swapchain type info: {}", swapchain_classname);
-
-        if (swapchain_classname.find("interposer::DXGISwapChain") != std::string_view::npos) { // DLSS3
-            spdlog::info("Found Streamline (DLSSFG) swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
-            m_using_frame_generation_swapchain = true;
-        } else if (swapchain_classname.find("FrameInterpolationSwapChain") != std::string_view::npos) { // FSR3
-            spdlog::info("Found FSR3 swapchain during dummy initialization: {:x}", (uintptr_t)swap_chain1);
-            m_using_frame_generation_swapchain = true;
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to get type info: {}", e.what());
-    } catch (...) {
-        spdlog::error("Failed to get type info: unknown exception");
-    }
+    // NOTE: REFramework detects DLSS-FG/FSR3 interposers here via RTTI on the swapchain class name.
+    // We INTENTIONALLY skip it: this is our OWN freshly-created dummy swapchain (never a frame-gen
+    // interposer), and a raw `typeid(*comptr)` reads vtable[-1] which ACCESS-VIOLATES on proxied/overlaid
+    // swapchains (an AV is not a C++ exception, so the try/catch did not save it — it hard-crashed FH5
+    // right after "Querying dummy swapchain"). m_using_frame_generation_swapchain stays false.
+    spdlog::info("Skipping dummy-swapchain RTTI frame-gen probe (not needed for the throwaway swapchain)");
 
     spdlog::info("Finding command queue offset");
 

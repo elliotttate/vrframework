@@ -278,6 +278,12 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains(VR* vr) {
 
         XrSwapchainCreateInfo swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         swapchain_create_info.arraySize = 1;
+        // MUST be the _SRGB variant. FH5's backbuffer holds sRGB-ENCODED display data; we CopyResource the
+        // bits verbatim (UNORM<->UNORM_SRGB are the same TYPELESS family, so no conversion). The runtime
+        // compositor (SimXR: runtime.cpp ~L3159) builds the sampling SRV from THIS format and writes to an
+        // _SRGB preview RTV. With _SRGB here: SRV decodes sRGB->linear on sample, RTV re-encodes -> correct.
+        // With plain UNORM the raw sRGB bits are treated as linear then encoded AGAIN -> blue boost, pink
+        // reads as purple. (A real HMD compositor follows the same convention.)
         swapchain_create_info.format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         swapchain_create_info.width = width;
         swapchain_create_info.height = height;

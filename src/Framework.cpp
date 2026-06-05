@@ -20,6 +20,7 @@
 #include "Framework.hpp"
 
 #include "Mods.hpp"
+#include "spi/IEngineAdapter.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -27,6 +28,7 @@
 
 #include <shlobj.h>
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 
 #include <imgui.h>
 
@@ -43,6 +45,19 @@ namespace fs = std::filesystem;
 Framework::Framework(HMODULE framework_module) {
     s_framework_module = framework_module;
 
+    // File log next to the game exe (FH5VR.log) — the only window we have into the mod's init/runtime
+    // inside a GUI game. flush_on(trace) so the last line survives a crash mid-init.
+    try {
+        const auto log_path = (get_persistent_dir() / "FH5VR.log").string();
+        auto file_logger = spdlog::basic_logger_mt("FH5VR", log_path, /*truncate=*/true);
+        spdlog::set_default_logger(file_logger);
+        spdlog::set_level(spdlog::level::debug);
+        spdlog::flush_on(spdlog::level::trace);
+        spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
+    } catch (...) {
+        // If the file can't be opened, fall through with the default (null) logger.
+    }
+
     spdlog::info("vrframework entry");
 
     IMGUI_CHECKVERSION();
@@ -52,7 +67,28 @@ Framework::Framework(HMODULE framework_module) {
     // (see initialize()), because D3D / the game window may not exist yet at load time.
     m_mods = std::make_unique<Mods>();   // Mods::Mods() comes from the consuming repo
 
+    // Auto-register the engine adapter from the mod list. (The consuming repo can't set it during
+    // Mods::Mods() because g_framework isn't assigned until make_unique<Framework> returns.) The VR
+    // mod reaches the seam via get_engine_adapter(), so this must be live before the first frame.
+    for (const auto& mod : m_mods->get_mods()) {
+        if (auto adapter = std::dynamic_pointer_cast<IEngineAdapter>(mod)) {
+            m_engine_adapter = adapter;
+            spdlog::info("Engine adapter registered: {}", adapter->get_name().data());
+            break;
+        }
+    }
+
     m_valid = true;
+
+    // Install the D3D12 present hook NOW (REFramework does this in its ctor too — see REFramework.cpp
+    // ~L708). D3D12Hook spins up a throwaway device+swapchain to steal the Present vtable slot, then
+    // detours it; the real game presents then drive the frame-init state machine (initialize() ->
+    // first_frame_initialize() -> mods init -> Fh5Adapter::install_hooks() + OpenXR). Without this the
+    // log stalls at "vrframework entry" forever. d3d12.dll is already resident (dllmain waited for it).
+    spdlog::info("hooking D3D12 from ctor");
+    if (!hook_d3d12()) {
+        spdlog::error("hook_d3d12() failed in ctor");
+    }
 }
 
 Framework::~Framework() {

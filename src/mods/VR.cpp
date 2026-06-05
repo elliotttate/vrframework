@@ -40,6 +40,23 @@ std::optional<std::string> VR::on_initialize_d3d_thread() {
         return err;
     }
 
+    // Wire the engine adapter's FrameTimeline to our frame lifecycle. The adapter reports per-frame
+    // events (from its camera/producer hook); the timeline routes them here to set eye parity and push
+    // per-eye matrices via apply_stereo. Without this the stereo path is dead (both eyes get the same
+    // mono frame -> FAIL_NO_PARALLAX). Callbacks are null-safe until VR is ready (on_wait_rendering /
+    // update_hmd_state early-out on !ready/!is_hmd_active).
+    if (auto adapter = g_framework->get_engine_adapter()) {
+        FrameTimeline::Callbacks cb{};
+        cb.on_wait_rendering   = [this](uint32_t f) { on_wait_rendering(f); };
+        cb.on_begin_rendering  = [this](uint32_t f) { on_begin_rendering(f); };
+        cb.on_update_hmd_state = [this](uint32_t f) { update_hmd_state(f); };
+        // on_request_imgui intentionally left unset: the camera/producer hook is not an imgui-safe edge.
+        adapter->timeline().set_callbacks(std::move(cb));
+        spdlog::info("[VR] FrameTimeline callbacks wired to adapter '{}'", adapter->get_name().data());
+    } else {
+        spdlog::warn("[VR] no engine adapter registered — stereo will not drive");
+    }
+
     m_init_finished = true;
     return std::nullopt;
 }
@@ -135,6 +152,13 @@ void VR::on_post_present() {
     // Advance the AFR frame counters. Under AFR each engine present is one eye.
     ++m_render_frame_count;
     ++m_presenter_frame_count;
+
+    // Latch the NEXT engine frame's eye + per-eye matrices for the engine camera hook to apply.
+    // This is the SINGLE per-present drive of the stereo path (the adapter's camera/producer hook fires
+    // many times per frame, so it must not drive parity itself). Frame N+1 then renders with eye
+    // parity(N+1) and on_present copies it to the matching eye swapchain — clean L/R alternation.
+    on_begin_rendering(m_render_frame_count);   // sets m_render_eye from parity
+    update_hmd_state(m_render_frame_count);      // update_matrices + push_stereo_to_adapter -> apply_stereo
 }
 
 void VR::on_device_reset() {

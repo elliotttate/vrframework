@@ -20,12 +20,8 @@
 Mods::Mods() {
     m_mods.emplace_back(VRConfig::get());
     m_mods.emplace_back(VR::get());
-
-    auto adapter = Fh5Adapter::get();
-    m_mods.emplace_back(adapter);
-
-    // The VR mod resolves the active engine seam through the framework, not a global.
-    if (g_framework != nullptr) {
-        g_framework->set_engine_adapter(adapter);
-    }
+    m_mods.emplace_back(Fh5Adapter::get());
+    // NOTE: the framework auto-registers the adapter (the IEngineAdapter in this list) into
+    // get_engine_adapter() right after constructing Mods — we can't do it here because g_framework
+    // isn't assigned until make_unique<Framework> returns. See Framework::Framework().
 }
