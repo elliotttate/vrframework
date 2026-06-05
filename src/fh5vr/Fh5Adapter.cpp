@@ -120,8 +120,11 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     auto original = g_producer_hook->get_original<ProducerFn>();
     const uint64_t calls = g_prodCalls.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    // Main-camera identity gate: only the gameplay view (near~0.1, far~50000). Everything else passes through.
-    const bool is_main = (a8 > 0.08f && a8 < 0.2f && a9 > 45000.0f && a9 < 55000.0f);
+    // Main-camera identity gate. The gameplay view uses near~0.1; shadow/reflection passes use near~0.01
+    // and UI uses near~0. The FAR plane varies by scene/draw-distance (seen 5000 in free-roam, 50000 at
+    // the showcase intro), so gate on near~0.1 + a generous far floor (>2000) to exclude the near-0.01/
+    // far-1000 shadow pass while catching the real camera regardless of its far value.
+    const bool is_main = (a8 > 0.06f && a8 < 0.2f && a9 > 2000.0f);
 
     // Unconditional diagnostic: confirms the hook fires AT ALL and surfaces each camera's near/far so we
     // can see why is_main isn't matching (e.g. the menu/intro camera uses different near/far than gameplay).
@@ -236,16 +239,32 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     if (!s_rest_set[eye]) { s_rest[eye] = G; s_rest_set[eye] = true; }
     glm::mat4 Grel = glm::affineInverse(s_rest[eye]) * G;
 
-    // Scale head translation (world units) and add the explicit per-eye IPD along local right. (Recenter
-    // removed the eye_to_head offset, so the IPD is re-added here to separate the eyes.)
+    // --- Coordinate-basis fix (derived + numerically verified) -----------------------------------
+    // OpenXR is (x-right, y-up, -z-forward); FH5's a4 local frame (per the proven freecam BuildA) is
+    // (x-right, y-up, +z-forward). The change of basis is B = diag(1,1,-1) (negate forward). B is its
+    // own inverse. Conjugating the head rotation by B maps head pitch->camera pitch(r0), yaw->yaw(r1),
+    // roll->roll(r2); rotating translation by B maps right/up/forward correctly. We also SPLIT rotation
+    // (applied about the head) from translation (recentered, re-added separately) so SimXR's floor-pivot
+    // pitch does not swing the camera.
+    constexpr glm::mat4 B{ 1.0f,0.0f,0.0f,0.0f,  0.0f,1.0f,0.0f,0.0f,  0.0f,0.0f,-1.0f,0.0f,  0.0f,0.0f,0.0f,1.0f };
+    const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Grel) * glm::mat3(B);   // B^-1 * R * B
+
+    // IPD magnitude is WORLD-SCALE: a4.row3 translation needs large values (the proven freecam needed
+    // ~120 units to exit the cockpit), so 0.032 (metres) is sub-millimetre and yields ZERO disparity.
+    // FH5_HALF_IPD_UNITS is the half-IPD in FH5 world units; calibrate against SimXR validate_stereo.
     const float ws = m_world_scale->value();
-    const float half_ipd = 0.032f * m_ipd_scale->value();      // ~32mm half-IPD
+    constexpr float FH5_HALF_IPD_UNITS = 1.5f;
+    const float half_ipd = FH5_HALF_IPD_UNITS * m_ipd_scale->value();
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    Grel[3] = glm::vec4(glm::vec3(Grel[3]) * ws + glm::vec3(ipd_sign * half_ipd, 0.0f, 0.0f), 1.0f);
+    glm::vec3 t_eng = glm::mat3(B) * glm::vec3(Grel[3]) * ws;   // head translation in engine-local axes
+    t_eng.x += ipd_sign * half_ipd;                            // IPD along engine-local right (+X)
+
+    glm::mat4 Gfix{ R_eng };
+    Gfix[3] = glm::vec4(t_eng, 1.0f);
 
     // Store raw column-major floats: this IS the row-vector delta for Mul(delta, a4) (column-major memory
     // == row-major transpose == row-vector form; the translation lands at [12..14] = FH5's a4.row3).
-    std::memcpy(s.delta, &Grel[0][0], 64);
+    std::memcpy(s.delta, &Gfix[0][0], 64);
 
     // --- Per-eye projection (FH5 reverse-Z row-vector layout) -----------------------------------
     // The glm per-eye projection is column-major; ForzaTech's a7 is row-vector reverse-Z. We transpose
