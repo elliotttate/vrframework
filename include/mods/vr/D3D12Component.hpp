@@ -39,8 +39,10 @@ struct ResourceCopier {
     void reset();
     void wait(uint32_t ms);
     // CopyResource src->dst with symmetric barrier pairs; states are restored on return.
+    // x_shift != 0 -> CopyTextureRegion shifting the image horizontally (DIAGNOSTIC: prove the two eye
+    // swapchains can hold independent content end-to-end through SimXR).
     void copy(ID3D12Resource* src, ID3D12Resource* dst,
-              D3D12_RESOURCE_STATES src_state, D3D12_RESOURCE_STATES dst_state);
+              D3D12_RESOURCE_STATES src_state, D3D12_RESOURCE_STATES dst_state, int x_shift = 0);
     void execute(ID3D12CommandQueue* queue);
 
     ComPtr<ID3D12CommandAllocator> allocator{};
@@ -74,7 +76,7 @@ private:
         void destroy_swapchains(VR* vr);
         // Acquire/wait/copy/release the swapchain image for eye `swapchain_idx`.
         void copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource* src,
-                  ID3D12Device* device, ID3D12CommandQueue* queue);
+                  ID3D12Device* device, ID3D12CommandQueue* queue, int x_shift = 0);
         void wait_for_all_copies();
 
         struct SwapchainContext {

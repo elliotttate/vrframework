@@ -105,27 +105,26 @@ bool TransformStereo(uint8_t* p) {
     const float ux = Vinv.m[4], uy = Vinv.m[5], uz = Vinv.m[6];   // camera +Y (up) in world
     const float fx = Vinv.m[8], fy = Vinv.m[9], fz = Vinv.m[10];  // camera +Z (forward) in world
 
-    // World-space displacement of the eye for the requested view-space offset.
+    // World-space displacement of the eye for the requested view-space offset (camera axes * offset).
     const float wdx = dx * rx + dy * ux + dz * fx;
     const float wdy = dx * ry + dy * uy + dz * fy;
     const float wdz = dx * rz + dy * uz + dz * fz;
 
-    // VIEW (world->view, column-vector): subtract the view-space offset from the translation column.
-    Mat4 Vnew = V;
-    Vnew.m[3]  -= dx;
-    Vnew.m[7]  -= dy;
-    Vnew.m[11] -= dz;
+    // These matrices are COLUMN-VECTOR (clip/view = M * pos_col; translation in COLUMN 3 = m[3],m[7],m[11];
+    // last ROW = (0,0,0,1)). Proven by the freecam's InvRigid reading tx=m[3],ty=m[7],tz=m[11] and LooksView
+    // requiring m[12..14]=0. To move the camera by +wd (world), POST-multiply by a column-vector translation
+    // that pre-shifts the input position by -wd: Mnew = M * Tcol(-wd). (Pre-multiplying a ROW-vector Trow was
+    // the bug -- it had zero render effect because the convention was wrong.) The camera-relative geometry
+    // fed to camRelVP is FIXED for the frame, so shifting the eye here does NOT cancel -> real parallax.
+    Mat4 Tcol{ {1,0,0,-wdx,  0,1,0,-wdy,  0,0,1,-wdz,  0,0,0,1} };   // column-vector translate by -wd
+    Mat4 Vnew        = Mul(V, Tcol);   // VIEW    @ 0x000 (world->view)
+    Mat4 VPnew       = Mul(P, Tcol);   // VP      @ 0x040 (world->clip)
+    Mat4 camRelVPnew = Mul(R, Tcol);   // camRelVP@ 0x100 (camRel->clip)  -- the parallax lever
 
-    // VP / camRelVP (row-vector): pre-translate world / camera-relative positions by -worldDelta, then
-    // apply the original projection composite. Mul(Trow(-wd), M).
-    Mat4 Trow{ {1,0,0,0, 0,1,0,0, 0,0,1,0, -wdx,-wdy,-wdz,1} };
-    Mat4 VPnew = Mul(Trow, P);
-    Mat4 camRelVPnew = Mul(Trow, R);
-
-    std::memcpy(p,        Vnew.m,       64);   // VIEW @ 0x000
-    std::memcpy(p + 64,   VPnew.m,      64);   // VP @ 0x040
-    std::memcpy(p + 256,  camRelVPnew.m, 64);  // camRelVP @ 0x100
-    std::memcpy(p + 0xC40, camRelVPnew.m, 64); // camRelVP exact duplicate @ 0xC40 (spec §1.2)
+    std::memcpy(p,         Vnew.m,        64);
+    std::memcpy(p + 64,    VPnew.m,       64);
+    std::memcpy(p + 256,   camRelVPnew.m, 64);
+    std::memcpy(p + 0xC40, camRelVPnew.m, 64);  // camRelVP exact duplicate @ 0xC40 (spec §1.2)
     return true;
 }
 

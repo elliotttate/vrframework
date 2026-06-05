@@ -321,7 +321,7 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     // longer does the lateral shift. The real stereo lever is the view-space shift on the camera-relative
     // VP in Fh5CameraCbuffer.cpp; we publish the per-eye VIEW-SPACE offset for it below. Keep the producer
     // ipd write disabled (0) so it does not pointlessly perturb a4.row3.
-    constexpr float FH5_HALF_IPD_UNITS = 3.15f;   // ~63mm at ~100 units/metre; tune via validate_stereo
+    constexpr float FH5_HALF_IPD_UNITS = 10.0f;   // detectable baseline while validating; dial to ~3.15 (63mm @ 100u/m) once stereo confirmed
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
     s.ipd_units = 0.0f;   // producer IPD off (cancels); downstream cbuffer applies the real shift
     s.eye_idx = eye;
@@ -331,6 +331,14 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     // confirmed (it has the same cancellation issue upstream and the same view-space fix here).
     const float half_ipd = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
     fh5cb::set_eye_offset(half_ipd, 0.0f, 0.0f, /*active=*/true);
+    // Diagnostic: confirm the per-eye offset alternates sign (eye0=-, eye1=+) reaching the cbuffer hook.
+    {
+        static std::atomic<int> s_last_eye{ -1 };
+        if (eye != s_last_eye.load(std::memory_order_relaxed)) {
+            s_last_eye.store(eye, std::memory_order_relaxed);
+            spdlog::info("[FH5IPD] eye={} half_ipd={:.2f} (offset published to cbuffer hook)", eye, half_ipd);
+        }
+    }
 
     // --- Per-eye projection (FH5 reverse-Z row-vector layout) -----------------------------------
     // The glm per-eye projection is column-major; ForzaTech's a7 is row-vector reverse-Z. We transpose

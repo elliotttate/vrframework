@@ -70,7 +70,7 @@ void ResourceCopier::wait(uint32_t ms) {
 }
 
 void ResourceCopier::copy(ID3D12Resource* src, ID3D12Resource* dst,
-                          D3D12_RESOURCE_STATES src_state, D3D12_RESOURCE_STATES dst_state) {
+                          D3D12_RESOURCE_STATES src_state, D3D12_RESOURCE_STATES dst_state, int x_shift) {
     if (allocator == nullptr || cmd_list == nullptr) {
         return;
     }
@@ -92,7 +92,20 @@ void ResourceCopier::copy(ID3D12Resource* src, ID3D12Resource* dst,
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 
     cmd_list->ResourceBarrier(2, barriers);
-    cmd_list->CopyResource(dst, src);
+    if (x_shift == 0) {
+        cmd_list->CopyResource(dst, src);
+    } else {
+        // DIAGNOSTIC: copy the image shifted right by x_shift px (src columns [0..W-x_shift) -> dst [x_shift..W)).
+        const auto sd = src->GetDesc();
+        const UINT w = (UINT)sd.Width, h = sd.Height;
+        const UINT sx = (x_shift > 0) ? 0u : (UINT)(-x_shift);
+        const UINT dx = (x_shift > 0) ? (UINT)x_shift : 0u;
+        const UINT cw = (w > (UINT)(x_shift > 0 ? x_shift : -x_shift)) ? w - (UINT)(x_shift > 0 ? x_shift : -x_shift) : 0u;
+        D3D12_TEXTURE_COPY_LOCATION d{}; d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; d.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION s{}; s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+        D3D12_BOX box{}; box.left = sx; box.top = 0; box.front = 0; box.right = sx + cw; box.bottom = h; box.back = 1;
+        cmd_list->CopyTextureRegion(&d, dx, 0, 0, &s, &box);
+    }
 
     // Restore both resources to their incoming states so the engine/runtime find them as left.
     barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -156,6 +169,16 @@ bool D3D12Component::on_frame(VR* vr) {
     // gameplay both agree (the producer applies the same per-present-latched eye), so this stays correct
     // for stereo while restoring reliable submission everywhere.
     const int applied_eye = (int)vr->get_current_render_eye();   // 0=LEFT, 1=RIGHT
+
+    // Diagnostic: log the copy-eye sequence so we can confirm consecutive presents alternate 0,1,0,1 (and
+    // thus the two swapchains receive DIFFERENT backbuffers). A stuck/duplicated eye -> both eyes identical.
+    {
+        static std::atomic<uint32_t> s_seq{ 0 };
+        const uint32_t n = s_seq.fetch_add(1, std::memory_order_relaxed);
+        if ((n % 120) < 6) {
+            spdlog::info("[VR-COPY] present#{} applied_eye={} bbIdx={}", n, applied_eye, backbuffer_index);
+        }
+    }
 
     // Begin the XR frame on the LEFT eye (first of the pair) so both copies land in a begun frame.
     if (applied_eye == 0 && !vr->m_openxr->frame_began) {
@@ -275,11 +298,25 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains(VR* vr) {
     this->contexts.resize(openxr->views.size());
     openxr->swapchains.clear();
 
-    const uint32_t width = vr->get_hmd_width();
-    const uint32_t height = vr->get_hmd_height();
+    // Size the eye swapchains to the LIVE BACKBUFFER, not the HMD's ideal per-eye size. The copy is a 1:1
+    // CopyResource (no scaling), so a swapchain that doesn't match the backbuffer dimensions makes every
+    // copy fail -> DEVICE_REMOVED crash (FH5 renders at e.g. 1600x843, not 1280x720). The OpenXR compositor
+    // scales whatever swapchain size we submit to the eye, so matching the backbuffer is both safe and
+    // correct. Fall back to the HMD size if the backbuffer can't be read.
+    uint32_t width = vr->get_hmd_width();
+    uint32_t height = vr->get_hmd_height();
+    DXGI_FORMAT bb_fmt_probe = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    {
+        ComPtr<ID3D12Resource> bb0{};
+        if (SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&bb0))) && bb0 != nullptr) {
+            const auto d = bb0->GetDesc();
+            if (d.Width > 0 && d.Height > 0) { width = (uint32_t)d.Width; height = d.Height; }
+            bb_fmt_probe = d.Format;
+        }
+    }
 
     for (size_t i = 0; i < openxr->views.size(); ++i) {
-        spdlog::info("[VR] Creating swapchain for eye {} ({}x{})", i, width, height);
+        spdlog::info("[VR] Creating swapchain for eye {} ({}x{}) [backbuffer-sized]", i, width, height);
 
         XrSwapchainCreateInfo swapchain_create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         swapchain_create_info.arraySize = 1;
@@ -291,13 +328,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains(VR* vr) {
         // (NOTE: R10G10B10A2 has no _SRGB DXGI variant; SimXR's preview can't sRGB-decode 10-bit, so its
         // "O" window may still look off for HDR gameplay even though the swapchain content + a real HMD
         // compositor are correct. Full fix would tonemap/convert HDR->8bit sRGB in the copy shader.)
-        DXGI_FORMAT bb_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        {
-            ComPtr<ID3D12Resource> bb{};
-            if (SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&bb))) && bb != nullptr) {
-                bb_fmt = bb->GetDesc().Format;
-            }
-        }
+        DXGI_FORMAT bb_fmt = bb_fmt_probe;
         DXGI_FORMAT xr_fmt;
         switch (bb_fmt) {
             case DXGI_FORMAT_R8G8B8A8_UNORM:
@@ -391,7 +422,7 @@ void D3D12Component::OpenXR::wait_for_all_copies() {
 }
 
 void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource* src,
-                                  ID3D12Device* device, ID3D12CommandQueue* queue) {
+                                  ID3D12Device* device, ID3D12CommandQueue* queue, int x_shift) {
     std::scoped_lock _{this->mtx};
 
     auto& openxr = vr->m_openxr;
@@ -445,7 +476,7 @@ void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource
     auto& copier = ctx.copiers[texture_index];
     copier->wait(INFINITE);
     copier->copy(src, ctx.textures[texture_index].texture,
-                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, x_shift);
     copier->execute(queue);
 
     // Release.
