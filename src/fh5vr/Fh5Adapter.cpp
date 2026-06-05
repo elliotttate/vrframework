@@ -18,6 +18,7 @@
 // per-eye projection) into g_stereo; the producer hook applies whatever is latched when it next fires.
 
 #include "Fh5Adapter.hpp"
+#include "Fh5CameraCbuffer.hpp"
 
 #include <Framework.hpp>
 #include <mods/VR.hpp>
@@ -131,6 +132,18 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     auto original = g_producer_hook->get_original<ProducerFn>();
     const uint64_t calls = g_prodCalls.fetch_add(1, std::memory_order_relaxed) + 1;
 
+    // Install the downstream camera-cbuffer hooks AS EARLY AS POSSIBLE (this hook fires during menu render,
+    // before the level loads), so the camera upload ring's creation is tracked. Idempotent; stops once the
+    // device + command queue are both available and hooked.
+    static std::atomic<bool> s_cb_done{ false };
+    if (!s_cb_done.load(std::memory_order_relaxed) && g_framework != nullptr) {
+        auto& d3d12 = g_framework->get_d3d12_hook();
+        if (d3d12 != nullptr && d3d12->get_device() != nullptr) {
+            fh5cb::ensure_installed(d3d12->get_device());   // fallback; primary install is the CreateDevice hook
+            s_cb_done.store(true, std::memory_order_relaxed);
+        }
+    }
+
     // Main-camera identity gate. The gameplay view uses near~0.1; shadow/reflection passes use near~0.01
     // and UI uses near~0. The FAR plane varies by scene/draw-distance (seen 5000 in free-roam, 50000 at
     // the showcase intro), so gate on near~0.1 + a generous far floor (>2000) to exclude the near-0.01/
@@ -159,9 +172,10 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
         StereoState dbg{}; const bool act = snapshot_stereo(dbg);
         if (dbg.eye_idx != s_last_logged_eye) {
             s_last_logged_eye = dbg.eye_idx;
-            spdlog::info("[FH5] main={} engaged={} active={} eye={} ipd={:.2f} appliedEye={} | dt=[{:.3f} {:.3f} {:.3f}]",
-                hits, g_engagedHits.load(), act, dbg.eye_idx, dbg.ipd_units, g_fh5_applied_eye.load(),
-                dbg.delta[12], dbg.delta[13], dbg.delta[14]);
+            spdlog::info("[FH5] main={} eye={} | dt=[{:.3f} {:.3f} {:.3f}] | cbuf: bufs={} cbv6912={} camHits={} writes={}",
+                hits, dbg.eye_idx,
+                dbg.delta[12], dbg.delta[13], dbg.delta[14],
+                fh5cb::buffers_tracked(), fh5cb::cbv6912_count(), fh5cb::cam_hits(), fh5cb::ring_writes());
         }
     }
 
@@ -302,13 +316,21 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     // == row-major transpose == row-vector form; the translation lands at [12..14] = FH5's a4.row3).
     std::memcpy(s.delta, &Gfix[0][0], 64);
 
-    // Per-eye IPD: carried SEPARATELY and applied along the rotated RIGHT axis in the producer hook (NOT
-    // baked into the delta, which mixed it through the rotation and cancelled parallax). ~63mm IPD at
-    // ~100 units/metre -> ~3.15 units half-IPD. Sweep FH5_HALF_IPD_UNITS / FH5_IpdScale via validate_stereo.
-    constexpr float FH5_HALF_IPD_UNITS = 40.0f;   // DIAGNOSTIC: huge, to rule out magnitude vs re-render
+    // Per-eye IPD is applied DOWNSTREAM now, not here. Upstream a4.row3 (world camera position) cancels
+    // under FH5's camera-relative rendering (proven live: ±40-unit IPD -> 0 disparity), so the producer no
+    // longer does the lateral shift. The real stereo lever is the view-space shift on the camera-relative
+    // VP in Fh5CameraCbuffer.cpp; we publish the per-eye VIEW-SPACE offset for it below. Keep the producer
+    // ipd write disabled (0) so it does not pointlessly perturb a4.row3.
+    constexpr float FH5_HALF_IPD_UNITS = 3.15f;   // ~63mm at ~100 units/metre; tune via validate_stereo
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    s.ipd_units = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
+    s.ipd_units = 0.0f;   // producer IPD off (cancels); downstream cbuffer applies the real shift
     s.eye_idx = eye;
+
+    // Publish the per-eye VIEW-SPACE camera offset for the downstream camera-cbuffer hook. For now this is
+    // IPD-only (lateral, +x = view-right); 6-DOF head translation will be folded in here once stereo is
+    // confirmed (it has the same cancellation issue upstream and the same view-space fix here).
+    const float half_ipd = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
+    fh5cb::set_eye_offset(half_ipd, 0.0f, 0.0f, /*active=*/true);
 
     // --- Per-eye projection (FH5 reverse-Z row-vector layout) -----------------------------------
     // The glm per-eye projection is column-major; ForzaTech's a7 is row-vector reverse-Z. We transpose

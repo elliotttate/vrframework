@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "Framework.hpp"
+#include "Fh5CameraCbuffer.hpp"
 
 // --- dxgi.dll proxy export forwarding (-> dxgi_real.dll) --------------------------------------------
 // Same ordinal-stable set the probe uses; the renderer calls CreateDXGIFactory* which forward through.
@@ -57,6 +58,11 @@ DWORD WINAPI bootstrap(void*) {
     if (d3d12 == nullptr) {
         return 1;
     }
+
+    // Hook D3D12CreateDevice BEFORE the framework (and the game) create their devices, so the downstream
+    // camera-cbuffer buffer-tracking hooks install at device creation and catch the camera ring's
+    // allocation (it is created during render init, before any later producer-triggered install).
+    fh5cb::install_createdevice_hook(d3d12);
 
     // Construct the framework. Its ctor hooks D3D12 present and runs the frame-init state machine;
     // the first present drives Mods init -> Fh5Adapter::install_hooks() (the producer detour).
