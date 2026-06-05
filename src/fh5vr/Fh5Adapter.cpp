@@ -43,11 +43,11 @@
 namespace {
 
 struct StereoState {
-    // HMD-driven camera delta, applied EXACTLY like the proven 6-DOF freecam: A = BuildA(pitch,yaw,roll),
-    // Mp = Mul(A, a4), then offset Mp.row3 along the rotated basis. Driving rotation as pitch/yaw/roll
-    // euler (not a view-matrix-derived 3x3) is what fixes the pitch->roll axis swap.
-    float pitch{ 0 }, yaw{ 0 }, roll{ 0 };   // radians, FH5 axis convention
-    float tx{ 0 }, ty{ 0 }, tz{ 0 };         // translation along the rotated basis {right, up, forward}
+    // Per-eye HMD delta as a ROW-VECTOR 4x4 (FH5 a4 convention), applied Mp = Mul(delta, a4). Composing
+    // rotation+translation as one matrix avoids the euler decomposition that bled pitch into roll. Stored
+    // as the raw floats of the glm column-major eye-to-local transform, which IS the row-vector matrix
+    // (column-major memory == row-major transpose == row-vector form). Identity at rest.
+    float delta[16]{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 
     // a7 replacement — per-eye projection in FH5 reverse-Z row-vector layout. When write_proj is
     // false we leave the engine projection untouched (parallax-only stereo; safe bring-up mode).
@@ -142,8 +142,9 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
         // is to APPLY the latched g_stereo below.
         if ((hits % 300) == 1) {
             StereoState dbg{}; const bool act = snapshot_stereo(dbg);
-            spdlog::info("[FH5] main={} engaged={} active={} | pyr=[{:.3f} {:.3f} {:.3f}] t=[{:.3f} {:.3f} {:.3f}]",
-                hits, g_engagedHits.load(), act, dbg.pitch, dbg.yaw, dbg.roll, dbg.tx, dbg.ty, dbg.tz);
+            spdlog::info("[FH5] main={} engaged={} active={} | dt=[{:.3f} {:.3f} {:.3f}] dr0=[{:.3f} {:.3f} {:.3f}]",
+                hits, g_engagedHits.load(), act, dbg.delta[12], dbg.delta[13], dbg.delta[14],
+                dbg.delta[0], dbg.delta[1], dbg.delta[2]);
         }
     }
 
@@ -156,16 +157,13 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
 
     if (engaged) {
         __try {
-            // ---- a4: proven 6-DOF freecam math. A = BuildA(pitch,yaw,roll); Mp = Mul(A, a4); then offset
-            //          Mp.row3 (camera-relative origin) along the rotated basis rows {right,up,fwd}. ----
+            // ---- a4: insert the per-eye HMD delta in front of the engine's camera-to-world:
+            //          new_a4 = Mul(delta, a4). delta is identity at rest, so the unmoved camera is
+            //          untouched; rotation + translation ride together with no axis decomposition. ----
             std::memcpy(saved_view, a4, 64);
             Mat4 M{}; std::memcpy(M.m, a4, 64);
-            Mat4 A = BuildA(s.pitch, s.yaw, s.roll);
-            Mat4 Mp = Mul(A, M);
-            const float* b = Mp.m;   // rotated basis: row0=right, row1=up, row2=forward
-            Mp.m[12] += s.tx*b[0] + s.ty*b[4] + s.tz*b[8];
-            Mp.m[13] += s.tx*b[1] + s.ty*b[5] + s.tz*b[9];
-            Mp.m[14] += s.tx*b[2] + s.ty*b[6] + s.tz*b[10];
+            Mat4 D{}; std::memcpy(D.m, s.delta, 64);
+            Mat4 Mp = Mul(D, M);
             std::memcpy(a4, Mp.m, 64);
             did_view = true;
 
@@ -227,37 +225,27 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     StereoState s{};
     s.active = true;
 
-    // --- Axis calibration (flip live as we converge on HMD feedback) ----------------------------
-    constexpr float SP = +1.0f, SY = +1.0f, SR = +1.0f;        // pitch / yaw / roll signs
-    constexpr float STX = +1.0f, STY = +1.0f, STZ = +1.0f;     // translation right / up / forward signs
+    // The per-eye pose lives in view.view[eye] (world->view); hmd_transform is not populated by the
+    // runtime. Eye-to-local (camera-to-world in the VR recenter frame) = inverse(view[eye]).
+    const glm::mat4 G = glm::affineInverse(view.view[eye]);
 
-    // The HMD pose lives in view.view[eye] (world->view); view.hmd_transform is NOT populated by the
-    // runtime (using it gave a frozen identity pose -> nothing moved). camera->world = inverse(view):
-    // its rotation is the head orientation in world, its [3] is the eye position in room space.
-    const glm::mat4 e2w = glm::affineInverse(view.view[eye]);
+    // Recenter against the first frame so the unmoved head -> identity delta (set_head_pose seats the
+    // head at y=1.7; without this the camera would be lifted/displaced at rest). Grel rides BOTH the
+    // rotation and the translation of the head's motion together, so there is no euler axis bleed.
+    static glm::mat4 s_rest[2]; static bool s_rest_set[2]{ false, false };
+    if (!s_rest_set[eye]) { s_rest[eye] = G; s_rest_set[eye] = true; }
+    glm::mat4 Grel = glm::affineInverse(s_rest[eye]) * G;
 
-    // --- Orientation -> Tait-Bryan euler (pitch about X, yaw about Y, roll about Z; OpenXR RH) ---
-    const glm::quat q = glm::normalize(glm::quat_cast(glm::mat3(e2w)));
-    const float sinp = 2.0f * (q.w * q.x - q.y * q.z);
-    const float pitch = (sinp >= 1.0f) ? 1.5707963f : (sinp <= -1.0f) ? -1.5707963f : std::asin(sinp);
-    const float yaw   = std::atan2(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.x * q.x + q.y * q.y));
-    const float roll  = std::atan2(2.0f * (q.w * q.z + q.x * q.y), 1.0f - 2.0f * (q.x * q.x + q.z * q.z));
-    s.pitch = SP * pitch;
-    s.yaw   = SY * yaw;
-    s.roll  = SR * roll;
-
-    // --- Translation: recenter the eye position so rest = 0 (set_head_pose sits the head at y=1.7),
-    //     apply only the head-MOVEMENT delta, then add the explicit per-eye IPD for stereo separation. ---
-    static glm::vec3 s_baseline[2]{}; static bool s_baseline_set[2]{ false, false };
-    const glm::vec3 eye_pos = glm::vec3(e2w[3]);
-    if (!s_baseline_set[eye]) { s_baseline[eye] = eye_pos; s_baseline_set[eye] = true; }
-    const glm::vec3 motion = eye_pos - s_baseline[eye];        // ~0 at rest; tracks head translation
+    // Scale head translation (world units) and add the explicit per-eye IPD along local right. (Recenter
+    // removed the eye_to_head offset, so the IPD is re-added here to separate the eyes.)
     const float ws = m_world_scale->value();
     const float half_ipd = 0.032f * m_ipd_scale->value();      // ~32mm half-IPD
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    s.tx = STX * (motion.x * ws + ipd_sign * half_ipd);        // right (+IPD splits the eyes)
-    s.ty = STY * (motion.y * ws);                              // up
-    s.tz = STZ * (-motion.z * ws);                             // forward (OpenXR -z is forward)
+    Grel[3] = glm::vec4(glm::vec3(Grel[3]) * ws + glm::vec3(ipd_sign * half_ipd, 0.0f, 0.0f), 1.0f);
+
+    // Store raw column-major floats: this IS the row-vector delta for Mul(delta, a4) (column-major memory
+    // == row-major transpose == row-vector form; the translation lands at [12..14] = FH5's a4.row3).
+    std::memcpy(s.delta, &Grel[0][0], 64);
 
     // --- Per-eye projection (FH5 reverse-Z row-vector layout) -----------------------------------
     // The glm per-eye projection is column-major; ForzaTech's a7 is row-vector reverse-Z. We transpose
