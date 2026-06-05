@@ -49,6 +49,12 @@ struct StereoState {
     // (column-major memory == row-major transpose == row-vector form). Identity at rest.
     float delta[16]{ 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 
+    // Signed per-eye IPD offset (FH5 world units). Applied in the producer hook ALONG THE ROTATED RIGHT
+    // axis (Mp.row0) AFTER Mul(delta,a4) — exactly like the proven freecam (mr*b[0]). Baking it into the
+    // delta row3 (and letting Mul mix it through the rotation) was why parallax cancelled.
+    float ipd_units{ 0 };
+    int   eye_idx{ 0 };   // 0=LEFT, 1=RIGHT — stamped so the D3D12 copy picks the eye the producer applied
+
     // a7 replacement — per-eye projection in FH5 reverse-Z row-vector layout. When write_proj is
     // false we leave the engine projection untouched (parallax-only stereo; safe bring-up mode).
     float proj[16]{};
@@ -98,6 +104,11 @@ inline Mat4 BuildA(float p, float y, float r) {
 }
 
 } // namespace
+
+// The eye (0=LEFT,1=RIGHT) the producer last APPLIED to the main camera. D3D12Component reads this to
+// copy the engine backbuffer into the matching eye swapchain — so the copied eye is always the eye the
+// producer actually rendered, eliminating the parity desync that made both eyes identical.
+std::atomic<int> g_fh5_applied_eye{ 0 };
 
 // ---------------------------------------------------------------------------
 // The 25-arg producer detour. Lifted from FH5CameraProbe/src/DxgiProxy.cpp (proven live), generalized
@@ -153,7 +164,10 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
 
     StereoState s{};
     const bool engaged = is_main && a4 != nullptr && snapshot_stereo(s);
-    if (engaged) g_engagedHits.fetch_add(1, std::memory_order_relaxed);
+    if (engaged) {
+        g_engagedHits.fetch_add(1, std::memory_order_relaxed);
+        g_fh5_applied_eye.store(s.eye_idx, std::memory_order_release);   // stamp eye for the D3D12 copy
+    }
 
     float saved_view[16];  bool did_view = false;
     float saved_proj[16];  bool did_proj = false;
@@ -167,6 +181,15 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
             Mat4 M{}; std::memcpy(M.m, a4, 64);
             Mat4 D{}; std::memcpy(D.m, s.delta, 64);
             Mat4 Mp = Mul(D, M);
+            // Per-eye IPD along the FINAL rotated RIGHT axis (Mp.row0), exactly like the proven freecam
+            // (Mp.m[12] += mr*b[0]...). Applying it here — NOT baked into the delta — is what keeps the
+            // left/right camera offset on the correct world axis so parallax doesn't cancel.
+            if (s.ipd_units != 0.0f) {
+                const float* b = Mp.m;
+                Mp.m[12] += s.ipd_units * b[0];
+                Mp.m[13] += s.ipd_units * b[1];
+                Mp.m[14] += s.ipd_units * b[2];
+            }
             std::memcpy(a4, Mp.m, 64);
             did_view = true;
 
@@ -228,9 +251,23 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     StereoState s{};
     s.active = true;
 
-    // The per-eye pose lives in view.view[eye] (world->view); hmd_transform is not populated by the
-    // runtime. Eye-to-local (camera-to-world in the VR recenter frame) = inverse(view[eye]).
-    const glm::mat4 G = glm::affineInverse(view.view[eye]);
+    // IMPORTANT: StereoView::view[eye] is LABELED world->view but the core actually fills it with the
+    // camera-to-world POSE (rotation_offset * hmd * eye_to_head) — see offline movement report. So it is
+    // ALREADY the eye-to-local transform; inverting it (as before) flipped translation and bled axes.
+    // Use it directly.
+    const glm::mat4 G = view.view[eye];
+
+    // Diagnostic (~1/s): pose vs inverse translation so we can confirm which tracks head motion correctly.
+    {
+        static std::atomic<uint32_t> dcount{ 0 };
+        if ((dcount.fetch_add(1, std::memory_order_relaxed) % 90) == 0) {
+            const glm::vec3 pose_t = glm::vec3(view.view[eye][3]);
+            const glm::vec3 inv_t  = glm::vec3(glm::affineInverse(view.view[eye])[3]);
+            const glm::vec3 hmd_t  = glm::vec3(view.hmd_transform[3]);
+            spdlog::info("[FH5POSE] eye={} poseT=[{:.3f} {:.3f} {:.3f}] invT=[{:.3f} {:.3f} {:.3f}] hmdT=[{:.3f} {:.3f} {:.3f}]",
+                eye, pose_t.x, pose_t.y, pose_t.z, inv_t.x, inv_t.y, inv_t.z, hmd_t.x, hmd_t.y, hmd_t.z);
+        }
+    }
 
     // Recenter against the first frame so the unmoved head -> identity delta (set_head_pose seats the
     // head at y=1.7; without this the camera would be lifted/displaced at rest). Grel rides BOTH the
