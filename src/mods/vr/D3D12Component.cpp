@@ -149,20 +149,24 @@ bool D3D12Component::on_frame(VR* vr) {
     // SpriteBatch blit here. Omitted in this scaffold; FH5's validated backbuffer is 8-bit.
     auto eye_texture = backbuffer.Get();
 
-    const auto frame_count = vr->m_render_frame_count;
+    // AFR eye selection: use the eye the PRODUCER actually applied to the main camera this frame (stamped
+    // in Fh5Adapter), NOT an independent present counter. The engine can run ahead of the present-driven
+    // latch, so a counter-derived eye could mismatch the camera that was rendered -> both swapchains get
+    // the same image (the disparity=0 bug). g_fh5_applied_eye guarantees copied-eye == rendered-eye.
+    extern std::atomic<int> g_fh5_applied_eye;
+    const int applied_eye = g_fh5_applied_eye.load(std::memory_order_acquire);   // 0=LEFT, 1=RIGHT
 
-    // AFR: even frame -> left eye (swapchain 0), odd frame -> right eye (swapchain 1).
-    // Parity->eye mapping is mutable (vr->m_left_eye_interval) so we can resync (guide 10 §8).
-    if (frame_count % 2 == vr->m_left_eye_interval) {
-        m_openxr.copy(vr, 0, eye_texture, device, command_queue);
-    } else {
-        m_openxr.copy(vr, 1, eye_texture, device, command_queue);
+    // Begin the XR frame on the LEFT eye (first of the pair) so both copies land in a begun frame.
+    if (applied_eye == 0 && !vr->m_openxr->frame_began) {
+        vr->m_openxr->begin_frame();
     }
+
+    m_openxr.copy(vr, applied_eye, eye_texture, device, command_queue);
 
     bool submitted = false;
 
-    // On the second eye of the pair, begin (if needed) + end the XR frame: both eyes are in.
-    if (frame_count % 2 == vr->m_right_eye_interval) {
+    // On the RIGHT eye (second of the pair), begin (if still needed) + end the XR frame: both eyes are in.
+    if (applied_eye == 1) {
         if (runtime->custom_stage == VRRuntime::SynchronizeStage::VERY_LATE) {
             runtime->synchronize_frame();
             if (!runtime->got_first_poses) {

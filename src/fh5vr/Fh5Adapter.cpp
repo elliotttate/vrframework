@@ -154,11 +154,14 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
         // VR::on_post_present — NOT here. The producer fires many times per frame, so reporting the
         // timeline here would scramble the L/R parity (-> both eyes identical). The producer's only job
         // is to APPLY the latched g_stereo below.
-        if ((hits % 300) == 1) {
-            StereoState dbg{}; const bool act = snapshot_stereo(dbg);
-            spdlog::info("[FH5] main={} engaged={} active={} | dt=[{:.3f} {:.3f} {:.3f}] dr0=[{:.3f} {:.3f} {:.3f}]",
-                hits, g_engagedHits.load(), act, dbg.delta[12], dbg.delta[13], dbg.delta[14],
-                dbg.delta[0], dbg.delta[1], dbg.delta[2]);
+        // Log on eye CHANGE (not a modulo, which aliases to one parity) so we can confirm L/R alternates.
+        static int s_last_logged_eye = -1;
+        StereoState dbg{}; const bool act = snapshot_stereo(dbg);
+        if (dbg.eye_idx != s_last_logged_eye) {
+            s_last_logged_eye = dbg.eye_idx;
+            spdlog::info("[FH5] main={} engaged={} active={} eye={} ipd={:.2f} appliedEye={} | dt=[{:.3f} {:.3f} {:.3f}]",
+                hits, g_engagedHits.load(), act, dbg.eye_idx, dbg.ipd_units, g_fh5_applied_eye.load(),
+                dbg.delta[12], dbg.delta[13], dbg.delta[14]);
         }
     }
 
@@ -286,15 +289,11 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     constexpr glm::mat4 B{ 1.0f,0.0f,0.0f,0.0f,  0.0f,1.0f,0.0f,0.0f,  0.0f,0.0f,-1.0f,0.0f,  0.0f,0.0f,0.0f,1.0f };
     const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Grel) * glm::mat3(B);   // B^-1 * R * B
 
-    // IPD magnitude is WORLD-SCALE: a4.row3 translation needs large values (the proven freecam needed
-    // ~120 units to exit the cockpit), so 0.032 (metres) is sub-millimetre and yields ZERO disparity.
-    // FH5_HALF_IPD_UNITS is the half-IPD in FH5 world units; calibrate against SimXR validate_stereo.
+    // Head translation: recenter delta scaled to FH5 world units. FH5 world units are ~cm (the proven
+    // freecam needed ~120 units to exit a ~1.2m cockpit -> ~100 units/metre), so FH5_WorldScale converts
+    // OpenXR metres -> FH5 units (default ~100). This is why head translation barely moved at ws=1.0.
     const float ws = m_world_scale->value();
-    constexpr float FH5_HALF_IPD_UNITS = 1.5f;
-    const float half_ipd = FH5_HALF_IPD_UNITS * m_ipd_scale->value();
-    const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
     glm::vec3 t_eng = glm::mat3(B) * glm::vec3(Grel[3]) * ws;   // head translation in engine-local axes
-    t_eng.x += ipd_sign * half_ipd;                            // IPD along engine-local right (+X)
 
     glm::mat4 Gfix{ R_eng };
     Gfix[3] = glm::vec4(t_eng, 1.0f);
@@ -302,6 +301,14 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     // Store raw column-major floats: this IS the row-vector delta for Mul(delta, a4) (column-major memory
     // == row-major transpose == row-vector form; the translation lands at [12..14] = FH5's a4.row3).
     std::memcpy(s.delta, &Gfix[0][0], 64);
+
+    // Per-eye IPD: carried SEPARATELY and applied along the rotated RIGHT axis in the producer hook (NOT
+    // baked into the delta, which mixed it through the rotation and cancelled parallax). ~63mm IPD at
+    // ~100 units/metre -> ~3.15 units half-IPD. Sweep FH5_HALF_IPD_UNITS / FH5_IpdScale via validate_stereo.
+    constexpr float FH5_HALF_IPD_UNITS = 40.0f;   // DIAGNOSTIC: huge, to rule out magnitude vs re-render
+    const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
+    s.ipd_units = ipd_sign * FH5_HALF_IPD_UNITS * m_ipd_scale->value();
+    s.eye_idx = eye;
 
     // --- Per-eye projection (FH5 reverse-Z row-vector layout) -----------------------------------
     // The glm per-eye projection is column-major; ForzaTech's a7 is row-vector reverse-Z. We transpose

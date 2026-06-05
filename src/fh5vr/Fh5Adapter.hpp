@@ -42,7 +42,9 @@ private:
     FrameTimeline m_timeline{};
 
     const ModSlider::Ptr m_ipd_scale{ ModSlider::create("FH5_IpdScale", 0.1f, 3.0f, 1.0f) };
-    const ModSlider::Ptr m_world_scale{ ModSlider::create("FH5_WorldScale", 0.05f, 2.0f, 1.0f) };
+    // FH5 world units are ~cm (~100 units/metre, from the freecam needing ~120 units to exit a ~1.2m
+    // cockpit). FH5_WorldScale = units per metre; converts OpenXR-metre head translation -> FH5 units.
+    const ModSlider::Ptr m_world_scale{ ModSlider::create("FH5_WorldScale", 10.0f, 400.0f, 100.0f) };
     const ModToggle::Ptr m_disable_taa{ ModToggle::create("FH5_DisableTAA", true) };
     ValueList m_options{ *m_ipd_scale, *m_world_scale, *m_disable_taa };
 };
