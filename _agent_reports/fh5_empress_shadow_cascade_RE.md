@@ -1,5 +1,10 @@
 # FH5 (Empress) — Shadow-Cascade RE: why head ROTATION breaks shadows, and where to inject it
 
+> ⚠️ **CORRECTIONS (2026-06-06) — read before trusting this report:**
+> 1. **§6 is WRONG: translation is NOT shadow-coherent.** Live test confirmed the shadows MOVE/SLIDE with the camera as you translate (the producer `a15/a16` cameraPos lever is downstream of the cascade fit, exactly like a4 rotation). The "translation already shadow-coherent (PROVEN)" claim caused a wasted detour; the real fix for BOTH rotation and translation is to inject at the camera-pose SOURCE upstream of the cascade fit.
+> 2. **The RVAs here are STALE.** This report's DB `fh5_b.i64` differs from the current shipping exe (`E:\Games\ForzaHorizon5Empress\ForzaHorizon5.exe` / `ForzaHorizon5.exe.i64`). On the current exe, RVA `0x6BE3A0` is NOT a function start; the publisher analog appears near RVA `0x6545A5` and adds `0x318` (not `0x320`). Re-derive every address on the CURRENT i64 before hooking.
+> 3. The static recommendation to inject at `+0x320` via the publisher conflicts with a RUNTIME finding that rotating `+0x320` (post-getter) did not move the view — being re-resolved on the current build (the timing/where-written may be the difference).
+
 Date: 2026-06-05
 DB: `E:\tmp\fh5_re\fh5_b.i64` (image base `0x140000000`, no anti-tamper). RVA = VA − 0x140000000.
 Method: headless idalib (IDA Pro 9.0). Producer ground-truth from the existing decompile shard

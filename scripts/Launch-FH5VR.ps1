@@ -31,7 +31,7 @@ param(
     [Alias("Ipd")]
     [float]$HalfIpdUnits = 0.032,
     [ValidateSet("driver","a4","off")]
-    [string]$RotationPath = "driver",
+    [string]$RotationPath = "a4",   # working interim: clean yaw/pitch/roll head-look (shadows follow). "driver" = experimental upstream-rotation path.
     [ValidateSet("proda15","input540","viewtail","ccam320","ccam320_d550","clone0","clone1","clone2","downstream","off")]
     [string]$PosLane = "proda15",
     [switch]$DisableProjection

@@ -669,7 +669,16 @@ DWORD WINAPI WorkerThread(void*) {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+// CRASH BISECT 2026-06-06: master gate for the XInput inline detour. The nvwgf2umx 0xc00000fd
+// stack-overflow crash (an access violation captured by NVIDIA's vectored exception handler, which then
+// recurses) recurs even with the dllmain install commented out — because start()/the worker re-install the
+// detour post-engine-seam (xinput=1 in fh5_state.txt). VEH runs before our SEH guards, so it cannot be
+// caught from inside the detour. Set false to disable the install in ALL paths (dllmain, start(), worker
+// retry) so we can confirm the inline xinput detour is the AV source. Keyboard PostMessage nav still works.
+std::atomic<bool> g_xinput_install_enabled{ false };
+
 void install_xinput_hook() {
+    if (!g_xinput_install_enabled.load(std::memory_order_acquire)) return;
     if (g_xinput_hooked.load(std::memory_order_acquire)) return;
     std::scoped_lock lk{ g_xinput_mtx };
     if (g_xinput_hooked.load(std::memory_order_relaxed)) return;

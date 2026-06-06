@@ -67,7 +67,9 @@ DWORD WINAPI bootstrap(void*) {
 
     // Install the XInput detour early so the menu navigator can inject controller input during the
     // title/menu flow — before the engine seam (and Fh5MenuNav::start) come up. Idempotent; start() retries.
-    fh5nav::install_xinput_hook();
+    // DISABLED (crash bisect 2026-06-06): testing whether the XInput inline detour contributes to the
+    // startup crash (vanilla FH5 is stable; the mod crashes). Re-enable after the bisect.
+    // fh5nav::install_xinput_hook();
 
     // Construct the framework. Its ctor hooks D3D12 present and runs the frame-init state machine;
     // the first present drives Mods init -> Fh5Adapter::install_hooks() (the producer detour).

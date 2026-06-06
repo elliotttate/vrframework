@@ -2281,7 +2281,12 @@ DWORD WINAPI WorkerThread(void*) {
 
         if (!object_to_use) {
             Pose hint{};
-            if (SnapshotPoseHint(hint)) {
+            // SCANS DISABLED 2026-06-06: ResolveMulticamByScan/RefcountScan/ByShape walked transient/guard
+            // pages during load and tripped NVIDIA's overlay VEH into a 0xc00000fd crash. The active camera
+            // is now captured (validated) from the per-frame sub_1407A1AC0 hook via capture_active_camera(),
+            // which publishes g_driver_object. While no camera is published yet (early load) the worker just
+            // idles below — no scanning, no first-chance AV. See [[fh5-nvidia-veh-crash]].
+            if (false && SnapshotPoseHint(hint)) {
                 const uint64_t now_ms = NowMs();
                 if (!object_to_use && (!tried_multicam_scan || now_ms - last_multicam_scan_ms >= 5000)) {
                     tried_multicam_scan = true;
@@ -2613,6 +2618,77 @@ DWORD WINAPI WorkerThread(void*) {
     // unreachable
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_GUARD tracer for the RENDERED camera's per-frame +0x90 angle writer (ported from
+// FH5CameraProbe/src/PageGuardTracerDll.cpp, which found sub_1407A1AC0 this way). Finds the upstream
+// head-look injection point (the function that writes g_driver_object+0x90 each frame). PAGE_GUARD — NOT a
+// HW data-bp (that crashes FH5). Our front VEH (AddVectoredExceptionHandler First=1) CONSUMES the guard
+// fault (EXCEPTION_CONTINUE_EXECUTION) so NVIDIA's overlay VEH never sees it. Gated to rot=driver; logs the
+// distinct writer RVAs to FH5VR.log ([FH5PGTRACE]). Hand the RVA to RE to decompile.
+PVOID g_pg_veh = nullptr;
+std::atomic<uintptr_t> g_pg_page{ 0 };      // guarded page base (0 = disarmed/consumed)
+std::atomic<int> g_pg_kind{ -1 };           // -1 none, 0 read, 1 write, 8 exec
+std::atomic<uintptr_t> g_pg_rip{ 0 }, g_pg_addr{ 0 };
+
+LONG CALLBACK PgVeh(EXCEPTION_POINTERS* ep) {
+    constexpr DWORD kGuard = 0x80000001;    // STATUS_GUARD_PAGE_VIOLATION
+    if (ep->ExceptionRecord->ExceptionCode != kGuard) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t fa = static_cast<uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
+    const uintptr_t pg = g_pg_page.load(std::memory_order_relaxed);
+    if (!pg || (fa & ~static_cast<uintptr_t>(0xFFF)) != pg) return EXCEPTION_CONTINUE_SEARCH;  // not our page
+    g_pg_kind.store(static_cast<int>(ep->ExceptionRecord->ExceptionInformation[0]));
+    g_pg_rip.store(static_cast<uintptr_t>(ep->ContextRecord->Rip));
+    g_pg_addr.store(fa);
+    g_pg_page.store(0);   // consume; guard auto-cleared -> re-exec succeeds; tracer re-arms
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+DWORD WINAPI PgTracerThread(void*) {
+    g_pg_veh = AddVectoredExceptionHandler(1, &PgVeh);   // FIRST -> before NVIDIA's overlay VEH
+    if (!EnsureModuleBase()) return 0;
+    uintptr_t seenW[8]{}; int nW = 0; uintptr_t seenR[8]{}; int nR = 0;
+    auto have = [](uintptr_t* a, int n, uintptr_t v) { for (int i = 0; i < n; ++i) if (a[i] == v) return true; return false; };
+    int arms = 0; uint64_t lastStatus = 0;
+    while (arms < 6000 && nW < 6) {
+        if (fh5cb::ctl_rotation_mode() != 2) { Sleep(150); continue; }   // only trace in rot=driver
+        const uintptr_t cam = g_driver_object.load(std::memory_order_acquire);
+        if (cam < 0x10000ull) { Sleep(50); continue; }
+        const uintptr_t watch = cam + 0x90;
+        const uintptr_t page = watch & ~static_cast<uintptr_t>(0xFFF);
+        g_pg_kind.store(-1);
+        g_pg_page.store(page);
+        DWORD old = 0;
+        if (!VirtualProtect(reinterpret_cast<LPVOID>(page), 0x1000, PAGE_READWRITE | PAGE_GUARD, &old)) {
+            g_pg_page.store(0); ++arms; Sleep(2); continue;
+        }
+        int k = -1;
+        for (int i = 0; i < 40; ++i) { Sleep(2); k = g_pg_kind.load(); if (k >= 0) break; }
+        ++arms;
+        if (k < 0) {   // no fault in window: lift the guard we set
+            const uintptr_t pg = g_pg_page.exchange(0);
+            if (pg) { DWORD o2 = 0; VirtualProtect(reinterpret_cast<LPVOID>(pg), 0x1000, PAGE_READWRITE, &o2); }
+            continue;
+        }
+        const uintptr_t rip = g_pg_rip.load(), fa = g_pg_addr.load();
+        const bool in90 = (fa >= watch && fa < watch + 12);   // [+0x90,+0x9C) = the Euler angle triple
+        const uintptr_t rrva = (rip >= g_module_base && rip < g_module_base + 0x10000000ull) ? rip - g_module_base : rip;
+        if (k == 1 && in90) {
+            if (!have(seenW, nW, rrva) && nW < 8) { seenW[nW++] = rrva;
+                spdlog::info("[FH5PGTRACE] +0x90 WRITER rva=0x{:X} cam=0x{:X} faddr_off=+0x{:X} (writers={})",
+                             rrva, cam, static_cast<unsigned>(fa - cam), nW);
+            }
+        } else if (k == 0 && in90) {
+            if (!have(seenR, nR, rrva) && nR < 8) seenR[nR++] = rrva;
+        }
+        const uint64_t now = NowMs();
+        if (now - lastStatus >= 2000) { lastStatus = now;
+            spdlog::info("[FH5PGTRACE] status arms={} +0x90_writers={} +0x90_readers={}", arms, nW, nR); }
+    }
+    spdlog::info("[FH5PGTRACE] DONE +0x90_writers={} (arms={}). RVAs above are the per-frame angle setter.", nW, arms);
+    if (g_pg_veh) { RemoveVectoredExceptionHandler(g_pg_veh); g_pg_veh = nullptr; }
+    return 0;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2620,6 +2696,8 @@ DWORD WINAPI WorkerThread(void*) {
 // ---------------------------------------------------------------------------
 void start() {
     if (g_started.exchange(true)) return;   // idempotent: launch the worker exactly once
+    // PAGE_GUARD tracer for the rendered camera's +0x90 writer (gated to rot=driver inside the thread).
+    if (HANDLE pg = CreateThread(nullptr, 0, &PgTracerThread, nullptr, 0, nullptr)) { CloseHandle(pg); }
     if (HANDLE t = CreateThread(nullptr, 0, &WorkerThread, nullptr, 0, nullptr)) {
         CloseHandle(t);
     } else {
@@ -2632,6 +2710,29 @@ void publish_driver(uintptr_t object) {
     if (object == 0) return;
     g_shape_driver_object.store(0, std::memory_order_release);
     g_driver_object.store(object, std::memory_order_release);
+    g_driver_publish_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+// AV-SAFE camera capture from the per-frame +0x320 writer hook (sub_1407A1AC0), whose a1 IS the live
+// camera. This REPLACES the worker's memory SCAN (ResolveMulticamByScan/RefcountScan/ByShape), which walked
+// transient/guard pages during "waiting for camera pointer" mid-load and raised a first-chance AV that
+// NVIDIA's overlay VEH turned into a 0xc00000fd stack-overflow crash ([[fh5-nvidia-veh-crash]]). `cam` was
+// just dereferenced by the engine (it read cam+0x48/0x60 and wrote cam+0x320), so cam+0 and cam+0x320 are
+// mapped — no arbitrary-memory fault. Validate (in-module vtable + known camera vtable + orthonormal +0x320)
+// then publish g_driver_object.
+void capture_active_camera(uintptr_t cam) {
+    if (cam < 0x10000ull) return;
+    if (g_driver_object.load(std::memory_order_acquire) == cam) return;   // already current; skip re-validate
+    uintptr_t vt = 0;
+    if (!SafeRead(cam, vt)) return;
+    vt = EffectiveObjectVtable(cam, vt);
+    if (!IsKnownCameraVtable(vt)) return;
+    Matrix4 m{};
+    if (!SafeCopyIn(cam + kCameraMatrixOffset, m.m.data(), sizeof(float) * m.m.size())) return;
+    Pose p{};
+    if (!DecodePose(m, p)) return;
+    g_shape_driver_object.store(0, std::memory_order_release);
+    g_driver_object.store(cam, std::memory_order_release);
     g_driver_publish_count.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -2728,6 +2829,11 @@ bool apply_camdriver_head_rotation(uintptr_t object) {
     const Matrix4 out = MulRowVector(rot, g_camrot_base);
     if (!SafeCopyOut(object + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) return false;
     g_camrot_written = out;
+    // DO NOT write +0x360. Raw disassembly of the +0x320 writer sub_1407A1AC0 (user, 2026-06-06) proves
+    // `+0x320` = the 4x4 cam-to-world (vtbl[0x60]()), and `+0x360` is a SCALAR (movss [rbx+0x360],xmm0 from
+    // vtbl[0xA0] — an FOV/scale), NOT an inverse view-tail. The old 64-byte ViewTailFromPose write here
+    // clobbered the FOV scalar + 60 bytes past it -> the "skyward"/washed-out/black render. The matrix at
+    // +0x320 is self-contained; rotating it (above) is sufficient. (kViewTailOffset/+0x360 belief was wrong.)
     {   // ~1/s diagnostic: confirms the getter fires + +0x320 is being rotated (calls climb while driving).
         static uint64_t s_last = 0;
         static uint64_t s_calls = 0;
@@ -2879,23 +2985,71 @@ static Matrix4 g_mc_written{};
 // the rebuild, before a4 copy) turns the view AND the cascades. pos (row3) preserved (translation lever owns
 // it). Anti-accumulated so a static basis doesn't spin.
 bool rotate_multicam_basis(uintptr_t ccam) {
-    if (ccam < 0x10000ull) return false;
-    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return false;
+    // Bail diagnostic (~1/s): pinpoints WHERE this returns early so we can see if the getter fires and
+    // which gate trips. Logs the S+0x650 basis vectors + S vtable so we can confirm the Lane-A source.
+    static uint64_t s_dbg_ms = 0;
+    const uint64_t dbg_now = NowMs();
+    const bool dbg = (dbg_now - s_dbg_ms >= 1000);
+    auto bail = [&](const char* why) -> bool {
+        if (dbg) { s_dbg_ms = dbg_now; spdlog::info("[FH5MCDBG] bail={} ccam=0x{:X} poslane={}", why, ccam, fh5cb::ctl_pos_lane()); }
+        return false;
+    };
+
+    if (ccam < 0x10000ull) return bail("ccam");
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return bail("poslane");
 
     uintptr_t S = 0;
-    if (!SafeRead(ccam + 0x48, S) || S < 0x10000ull) return false;
+    if (!SafeRead(ccam + 0x48, S) || S < 0x10000ull) return bail("S_read");
+
+    // GATE (mandatory, AV-safe): S must be a real object whose vtable lies in the FH5 module before we
+    // dereference S+0x650. NVIDIA's overlay VEH turns ANY first-chance AV into a fatal stack overflow
+    // BEFORE our SEH __except runs (see [[fh5-nvidia-veh-crash]]), so we must NOT fault — validate the
+    // vtable pointer range first. The byte-verified RE (fh5_empress_upstream_pose_writer_RE.md) says the
+    // active gameplay view-source S is a CMultiCam (vtable 0x145E1E558); accept any in-module vtable +
+    // the orthonormal-basis check below as the offset-free discriminator.
+    uintptr_t svt = 0;
+    if (!SafeRead(S, svt) || svt < kIdaImageBase || svt >= 0x148000000ull) return bail("svt");
+
+    // One-shot layout probe per distinct camera object: dump vtables + which candidate offsets hold a
+    // genuine orthonormal basis, so we can see WHICH camera/offset feeds the producer a4.
+    {
+        static uintptr_t seen[12]{}; static int seen_n = 0; bool known = false;
+        for (int i = 0; i < seen_n; ++i) if (seen[i] == ccam) { known = true; break; }
+        if (!known && seen_n < 12) {
+            seen[seen_n++] = ccam;
+            auto orthoAt = [](uintptr_t addr) -> int {
+                Matrix4 m{};
+                if (!SafeCopyIn(addr, m.m.data(), sizeof(float) * m.m.size())) return -1;
+                const Vec3 a{ m.m[0], m.m[1], m.m[2] }, b{ m.m[4], m.m[5], m.m[6] }, c{ m.m[8], m.m[9], m.m[10] };
+                return LooksLikeRotationBasis(a, b, c) ? 1 : 0;
+            };
+            uintptr_t camvt = 0, svt = 0; SafeRead(ccam, camvt); SafeRead(S, svt);
+            auto row0 = [](uintptr_t addr, float* out) { Matrix4 m{}; if (SafeCopyIn(addr, m.m.data(), sizeof(float)*m.m.size())) { out[0]=m.m[0]; out[1]=m.m[1]; out[2]=m.m[2]; } else { out[0]=out[1]=out[2]=0; } };
+            float r320[3]{}, r550[3]{}; row0(ccam + 0x320, r320); row0(ccam + 0x550, r550);
+            spdlog::info("[FH5MCPROBE] cam=0x{:X} camvt=0x{:X} ortho@550={} ortho@320={} | S=0x{:X} svt=0x{:X} ortho@S650={} ortho@S600={} | @320(0x{:X})=({:.3f},{:.3f},{:.3f}) @550(0x{:X})=({:.3f},{:.3f},{:.3f})",
+                         ccam, camvt, orthoAt(ccam + 0x550), orthoAt(ccam + 0x320),
+                         S, svt, orthoAt(S + 0x650), orthoAt(S + 0x600),
+                         ccam + 0x320, r320[0], r320[1], r320[2], ccam + 0x550, r550[0], r550[1], r550[2]);
+        }
+    }
 
     float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
     Pose delta{};
     int eye = 0;
-    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return false;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return bail("snapshot");
 
     Matrix4 M{};   // S+0x650: right(row0)/up(row1)/forward(row2)/pos(row3)
-    if (!SafeCopyIn(S + 0x650, M.m.data(), sizeof(float) * M.m.size())) return false;
+    if (!SafeCopyIn(S + 0x650, M.m.data(), sizeof(float) * M.m.size())) return bail("readbasis");
     const Vec3 r0{ M.m[0], M.m[1], M.m[2] };
     const Vec3 r1{ M.m[4], M.m[5], M.m[6] };
     const Vec3 r2{ M.m[8], M.m[9], M.m[10] };
-    if (!LooksLikeRotationBasis(r0, r1, r2)) return false;   // only touch a genuine orthonormal basis
+    if (dbg) {
+        uintptr_t svt = 0; SafeRead(S, svt);
+        s_dbg_ms = dbg_now;
+        spdlog::info("[FH5MCDBG] reached-basis ccam=0x{:X} S=0x{:X} Svt=0x{:X} r0=({:.3f},{:.3f},{:.3f}) r1=({:.3f},{:.3f},{:.3f}) r2=({:.3f},{:.3f},{:.3f})",
+                     ccam, S, svt, r0.x, r0.y, r0.z, r1.x, r1.y, r1.z, r2.x, r2.y, r2.z);
+    }
+    if (!LooksLikeRotationBasis(r0, r1, r2)) return bail("notbasis");   // only touch a genuine orthonormal basis
 
     Matrix4 base{};
     if (g_mc_obj != S) {
@@ -2909,9 +3063,6 @@ bool rotate_multicam_basis(uintptr_t ccam) {
         g_mc_base = M;       // fresh car-derived basis
     }
 
-    Vec4 mirror{};
-    const bool have_mirror = SafeCopyIn(S + 0x600, &mirror, sizeof(mirror));
-
     Matrix4 R{};
     R.m[0]  = delta.right.x;   R.m[1]  = delta.right.y;   R.m[2]  = delta.right.z;   R.m[3]  = 0.0f;
     R.m[4]  = delta.up.x;      R.m[5]  = delta.up.y;      R.m[6]  = delta.up.z;      R.m[7]  = 0.0f;
@@ -2922,32 +3073,96 @@ bool rotate_multicam_basis(uintptr_t ccam) {
     if (!SafeCopyOut(S + 0x650, Mp.m.data(), sizeof(float) * Mp.m.size())) return false;
     g_mc_written = Mp;
 
-    // Sync S+0x600 (the row fed to a4): detect which base row it mirrors, write the rotated counterpart.
-    int mr = -1;
-    if (have_mirror) {
-        for (int r = 0; r < 3; ++r) {
-            if (std::fabs(base.m[r * 4] - mirror.x) < 2e-3f &&
-                std::fabs(base.m[r * 4 + 1] - mirror.y) < 2e-3f &&
-                std::fabs(base.m[r * 4 + 2] - mirror.z) < 2e-3f) { mr = r; break; }
-        }
-        if (mr >= 0) {
-            const Vec4 nm{ Mp.m[mr * 4], Mp.m[mr * 4 + 1], Mp.m[mr * 4 + 2], mirror.w };
-            SafeCopyOut(S + 0x600, &nm, sizeof(nm));
-        }
+    // Re-do sub_14060B390's transpose-gather from the ROTATED basis so the per-frame getter's CMultiCam
+    // builder (slot 0x68 returns *(S+0x600)) and the a4-assembler read the rotated rows -> producer a4 (and
+    // the cascade fit, which consumes the same view basis) follow head-look. Engine formula
+    // (fh5_empress_upstream_pose_writer_RE.md §3): S+0x600 = (M[2],M[6],M[10]); S+0x610 = (M[1],M[5],M[9])
+    // where M = the S+0x650 row-major basis. These are basis COLUMNS (they rotate with the basis), so
+    // recomputing from Mp keeps S+0x600/0x610 consistent with the rotated S+0x650. Preserve the w lanes.
+    {
+        Vec4 c600{}, c610{};
+        SafeCopyIn(S + 0x600, &c600, sizeof(c600));
+        SafeCopyIn(S + 0x610, &c610, sizeof(c610));
+        const float g600[4]{ Mp.m[2], Mp.m[6], Mp.m[10], c600.w };
+        const float g610[4]{ Mp.m[1], Mp.m[5], Mp.m[9],  c610.w };
+        SafeCopyOut(S + 0x600, g600, sizeof(g600));
+        SafeCopyOut(S + 0x610, g610, sizeof(g610));
     }
 
-    {   // ~1/s verify log: confirm S+0x650 basis (row2=forward should match the producer a4 forward) + mirror row
+    {   // ~1/s verify log: forward row of S+0x650 base vs rotated; confirms the Lane-A source is being turned
         static uint64_t s_last = 0;
         const uint64_t now = NowMs();
         if (now - s_last >= 1000) {
             s_last = now;
-            spdlog::info("[FH5MCROT] S=0x{:X} base_fwd=({:.3f},{:.3f},{:.3f}) base_right=({:.3f},{:.3f},{:.3f}) "
-                         "mirror600=({:.3f},{:.3f},{:.3f}) mirrorRow={} rotApplied=1",
-                         S, base.m[8], base.m[9], base.m[10], base.m[0], base.m[1], base.m[2],
-                         mirror.x, mirror.y, mirror.z, mr);
+            spdlog::info("[FH5MCROT] S=0x{:X} svt=0x{:X} base_fwd=({:.3f},{:.3f},{:.3f}) rot_fwd=({:.3f},{:.3f},{:.3f}) rotApplied=1",
+                         S, svt, base.m[8], base.m[9], base.m[10], Mp.m[8], Mp.m[9], Mp.m[10]);
         }
     }
     return true;
+}
+
+// UPSTREAM head-look injection at the camera-state interpolator fh5_cam_LerpCameraStateStruct
+// (RVA 0xC7F270). Per the user's dataflow RE: this lerp writes the camera's Euler angle triple at
+// +0x90 (Y/yaw), +0x94 (X/pitch), +0x98 (Z/roll) every frame from the SOURCE state (a2); then
+// sub_1407A1AC0 READS cam+0x90 to BUILD cam+0x320 (-> producer a4). So this is UPSTREAM of +0x320 and
+// (if the cull/cascade fit snapshots after the lerp) upstream of the cull too — the single point that can
+// make view + culling + shadows all follow head-look. We set cam+0x90/94/98 = source+0x90/94/98 + head
+// Euler (fresh source as the base => no accumulation, no lerp damping/lag). a1/a2 were just dereferenced by
+// the original lerp at these exact offsets, so reading/writing them is AV-safe.
+bool apply_lerp_angle_head_rotation(uintptr_t cam, uintptr_t src) {
+    static uint64_t s_dbg = 0;
+    const uint64_t dnow = NowMs();
+    const bool dbg = (dnow - s_dbg >= 1000);
+    auto bail = [&](const char* why) -> bool {
+        if (dbg) { s_dbg = dnow; spdlog::info("[FH5LERPDBG] bail={} cam=0x{:X} poslane={}", why, cam, fh5cb::ctl_pos_lane()); }
+        return false;
+    };
+    if (cam < 0x10000ull || src < 0x10000ull) return bail("ptr");
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return bail("poslane");
+
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return bail("snapshot");
+
+    // Head Euler from the published delta basis (right/up/forward). Identity basis -> 0,0,0.
+    const Vec3 f = delta.forward, r = delta.right, u = delta.up;
+    float fy = f.y; if (fy > 1.0f) fy = 1.0f; if (fy < -1.0f) fy = -1.0f;
+    const float yaw   = std::atan2(f.x, f.z);   // around up   -> cam+0x90
+    const float pitch = std::asin(fy);          // around right-> cam+0x94
+    const float roll  = std::atan2(r.y, u.y);   // around fwd  -> cam+0x98
+    if (!std::isfinite(yaw) || !std::isfinite(pitch) || !std::isfinite(roll)) return bail("nan");
+    if (std::fabs(yaw) < 1e-4f && std::fabs(pitch) < 1e-4f && std::fabs(roll) < 1e-4f) return bail("identity");
+
+    float s90 = 0.0f, s94 = 0.0f, s98 = 0.0f;
+    if (!SafeRead(src + 0x90, s90) || !SafeRead(src + 0x94, s94) || !SafeRead(src + 0x98, s98)) return bail("read");
+    if (!std::isfinite(s90) || !std::isfinite(s94) || !std::isfinite(s98)) return bail("srcnan");
+    if (std::fabs(s90) > 1000.0f || std::fabs(s94) > 1000.0f || std::fabs(s98) > 1000.0f) {
+        if (dbg) { s_dbg = dnow; spdlog::info("[FH5LERPDBG] bail=range cam=0x{:X} s90={:.2f} s94={:.2f} s98={:.2f}", cam, s90, s94, s98); }
+        return false;
+    }
+
+    const float o90 = s90 + yaw, o94 = s94 + pitch, o98 = s98 + roll;
+    SafeCopyOut(cam + 0x90, &o90, sizeof(o90));
+    SafeCopyOut(cam + 0x94, &o94, sizeof(o94));
+    SafeCopyOut(cam + 0x98, &o98, sizeof(o98));
+    {   // ~1/s
+        static uint64_t s_last = 0;
+        const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5LERP] cam=0x{:X} base(90,94,98)=({:.3f},{:.3f},{:.3f}) head(yaw,pit,rol)=({:.3f},{:.3f},{:.3f})",
+                         cam, s90, s94, s98, yaw, pitch, roll);
+        }
+    }
+    return true;
+}
+
+bool apply_active_camdriver_head_rotation() {
+    uintptr_t obj = g_driver_object.load(std::memory_order_acquire);
+    if (obj < 0x10000ull) obj = g_shape_driver_object.load(std::memory_order_acquire);
+    if (obj < 0x10000ull) return false;
+    return apply_camdriver_head_rotation(obj);
 }
 
 void on_input540_fold(uintptr_t object) {

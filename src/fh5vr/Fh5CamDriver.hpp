@@ -28,6 +28,11 @@ void start();
 // +0x320 matrix is being published by the engine this frame.
 void publish_driver(uintptr_t object);
 
+// AV-safe active-camera capture from the per-frame +0x320 writer hook (sub_1407A1AC0; a1 = live camera).
+// Validates (in-module + known camera vtable + orthonormal +0x320) then publishes g_driver_object.
+// Replaces the worker's memory scan, which faulted mid-load and tripped NVIDIA's overlay VEH (crash).
+void capture_active_camera(uintptr_t cam);
+
 // Called by the deterministic sub_140746BB0 bridge hook. `object` is the ForzaMultiCam object; the worker
 // reads its active camera slot at +0x5C8/+0x5D0 and validates the concrete camera matrix before writing.
 void publish_multicam(uintptr_t object);
@@ -62,6 +67,18 @@ bool current_local_offset(float& strafe, float& up, float& fwd);
 // AND the shadow cascades (which read +0x320, not the producer a4) follow head-look. Gated to a known
 // camera vtable with an orthonormal-basis sanity check. Returns true if it wrote the pose.
 bool apply_camdriver_head_rotation(uintptr_t object);
+
+// Same as apply_camdriver_head_rotation but targets the worker-RESOLVED active gameplay camera object
+// (g_driver_object). Called from the per-frame +0x320 WRITER hook (sub_1407A2726) POST-original, so the
+// rotation lands on the just-written +0x320 BEFORE the render-view pass copies it into the producer a4 and
+// fits the shadow cascades. Returns true if it rotated a valid camera.
+bool apply_active_camdriver_head_rotation();
+
+// UPSTREAM head-look injection at fh5_cam_LerpCameraStateStruct (RVA 0xC7F270). cam=a1 (dest camera),
+// src=a2 (source state). Adds head Euler to the camera angle triple cam+0x90/0x94/0x98 (using src as the
+// clean base), upstream of sub_1407A1AC0's +0x320 build and (if the cull snapshots after the lerp) the
+// cull/cascade fit. Call POST-original. Gated to rot=driver + active head delta.
+bool apply_lerp_angle_head_rotation(uintptr_t cam, uintptr_t src);
 
 // Runtime camera-orientation probe (dumpcam / pokerot / pokerotvs control-file knobs). Called post-fold on
 // the active CCamDriver to locate + live-rotate the orientation source the shadow cascades consume.

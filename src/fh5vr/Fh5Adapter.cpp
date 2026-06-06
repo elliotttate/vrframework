@@ -238,6 +238,11 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
         if (a4 != nullptr) {
             const float* pose_hint = reinterpret_cast<const float*>(a4);
             fh5cam::publish_pose_hint(pose_hint);
+            // NOTE: the old [FH5A4]/[FH5A6] diagnostic here dereferenced a15 (bits-as-pointer) and a6 inside a
+            // __try — but NVIDIA's overlay VEH turns any first-chance AV fatal BEFORE our __except runs (see
+            // [[fh5-nvidia-veh-crash]]). At camera transitions a15/a6 are transiently non-pointer, so that
+            // deref was a residual crash source. Removed (its findings: a4.row2 == +0x320 fwd; a6 is a scaled
+            // non-orthonormal transform; view ~ transpose(a4) + a4*a6).
 #if 0
             // Disabled while stabilizing startup: these are useful for finding the active camera object
             // without a process-wide scan, but probing every producer argument can perturb menu/driver
@@ -500,16 +505,123 @@ using AimGetterFn = char(__fastcall*)(void*, __int64, unsigned char);
 static std::unique_ptr<FunctionHook> g_aim_getter_hook;
 
 static char __fastcall Hook_AimGetter(void* a1, __int64 a2, unsigned char a3) {
-    // Let the getter REBUILD the camera orientation at +0x320 first, then rotate the freshly-rebuilt matrix
-    // by the head delta. Runtime scan proved +0x320 is the only orthonormal basis (= a4); the getter is its
-    // per-frame rebuilder/clobberer, so rotating POST-original (after the rebuild, before the producer reads
-    // a4 and the cascades fit) is what makes the head rotation stick for both. Anti-accumulated.
+    // SHADOW-COHERENT head-look — LANE A (the real lever). RE (fh5_empress_upstream_pose_writer_RE.md)
+    // proved the producer's a4 AND the shadow cascades derive from the CMultiCam world basis at S+0x650
+    // (S=*(camera+0x48)), transpose-gathered into S+0x600 — NOT the +0x320 "Lane B" renderer snapshot the
+    // old freecam poked (which is why rotating +0x320 post-getter never moved the producer view). The
+    // world-basis producer sub_14060B390 rebuilds S+0x650 each frame BEFORE this getter; we rotate it (and
+    // re-sync the S+0x600 gather row the builder returns) HERE, BEFORE the getter copies the basis into a4
+    // (+0x550), so a4 AND the cascade fit both follow head-look. Anti-accumulated (compose-on-top of the
+    // freshly-rebuilt base); gated to poslane=proda15 + a live CMultiCam view-source with an orthonormal
+    // basis. Producer a4 stays identity in this mode (rot=driver -> rot_mode 2 in apply_stereo).
+    // NOTE: rotating +0x320 / S+0x650 HERE is TOO LATE — the producer a4 is copied from +0x320's BASE value
+    // before this getter fires (proven: [FH5A4] a4==+0x320 baseFwd, not the rotated outFwd). The rotation now
+    // lives in the per-frame +0x320 WRITER hook (sub_1407A1AC0).
+    //
+    // LANE-A DISABLED (2026-06-06): the report's Lane A (a4 <- +0x550 <- S+0x600 <- S+0x650) is a RUNTIME
+    // NO-OP on this build. Live probe of EVERY camera class (cockpit/hood/bumper/chase) showed +0x550 and
+    // S+0x650 are junk while +0x320 holds the orthonormal basis (= producer a4); [FH5MCROT] fired 0 times.
+    // So rotate_multicam_basis never found a clean basis — it only ever READ S+0x650 (an AV risk: while
+    // driving, S churns and S+0x650 (0x650 bytes into a transient object) can be unmapped -> first-chance AV
+    // -> NVIDIA overlay VEH stack overflow, see [[fh5-nvidia-veh-crash]]). Removed the call entirely. The live
+    // rotation path is rot=a4 (producer hook rotates the a4 arg directly — clean view, world-anchored shadows).
     auto original = g_aim_getter_hook->get_original<AimGetterFn>();
-    const char ret = original(a1, a2, a3);
+    return original(a1, a2, a3);
+}
+
+// a4-assembler sub_1407AC2D0 (RVA 0x7AC2D0, CCamDriver vtable slot 0x370): per-frame, this=CCamDriver,
+// this+0x48 = CMultiCam view-source S; it builds a4 rows this+0x550 from S->vtbl[104] (= *(S+0x600)). The
+// getter sub_1407A9DD0 fires for a non-gameplay AGGREGATE camera (its +0x48 is not a CMultiCam) on this
+// build, so the a4-assembler is the path that produces the GAMEPLAY camera's a4. Rotate the Lane-A source
+// (S+0x650 / S+0x600) PRE-trampoline here too, so the gameplay a4 + cascades follow head-look.
+using A4AsmFn = void*(__fastcall*)(void*, void*, void*, void*);
+static std::unique_ptr<FunctionHook> g_a4asm_hook;
+static void* __fastcall Hook_A4Assembler(void* a1, void* a2, void* a3, void* a4) {
+    // LANE-A DISABLED (2026-06-06): same as the getter — Lane A (+0x550/S+0x650) is a runtime no-op (a4 is
+    // Lane B / +0x320 on every camera live; [FH5MCROT]=0), and reading S+0x650 while driving AV'd. Removed.
+    auto original = g_a4asm_hook->get_original<A4AsmFn>();
+    return original(a1, a2, a3, a4);
+}
+
+// Per-frame +0x320 WRITER sub_1407A2726 (RVA 0x7A2726): the camera function that contains the
+// `movaps [rbp+0x320]` store (0x7A2C2B) — a candidate per-frame writer of the camera-to-world basis the
+// producer a4 + shadow cascades derive from. Rotate the RESOLVED active camera's +0x320 POST-original
+// (i.e. right after this writes the base pose), BEFORE the render-view pass copies it into a4 / fits the
+// cascades. If a4 then follows ([FH5A4] forward == rotated outFwd), this is the upstream lever.
+using PoseWriterFn = void*(__fastcall*)(void*, void*, void*, void*);
+static std::unique_ptr<FunctionHook> g_posewriter_hook;
+static std::atomic<uint64_t> g_posewriter_calls{ 0 };
+static void* __fastcall Hook_PoseWriter(void* a1, void* a2, void* a3, void* a4) {
+    auto original = g_posewriter_hook->get_original<PoseWriterFn>();
+    void* r = original(a1, a2, a3, a4);
+    // CORRECTED 2026-06-06 (raw disasm of sub_1407A1AC0 @0x7A1AC0): a1 (rcx/rbx) IS the CAMERA (this), not
+    // the ancestor. The original just wrote camera+0x320 = the 4x4 cam-to-world (from vtbl[0x60]()). We
+    // rotate THAT +0x320 here POST-write, BEFORE the render-view pass copies it into the producer a4 AND
+    // fits the shadow cascades (both derive from +0x320 live on this build). apply_camdriver_head_rotation
+    // rotates ONLY +0x320 now (the old +0x360 64-byte write corrupted a scalar FOV field = the black screen).
+    // Gated to a known camera vtable + orthonormal basis + rot=driver; no-op otherwise. This is the
+    // shadow-coherent lever: if shadows now follow head-look, +0x320 is upstream of the cascade fit.
+    // ROTATION DISABLED again (2026-06-06): post-rotating +0x320 here rotated the view (a4 follows) but the
+    // cull/cascade fit reads an UPSTREAM snapshot, so near geometry culled (washout). The rotation moved to
+    // fh5_cam_LerpCameraStateStruct (upstream of this writer's +0x90 read), so sub_1407A1AC0 now rebuilds
+    // +0x320 NATIVELY from the head-rotated angles — rotating here too would double-apply. Diagnostic only.
+    // Capture the live camera (a1) for the worker — replaces the crash-prone memory scan. AV-safe: a1 was
+    // just dereferenced by the original writer, and capture_active_camera validates before publishing.
     if (a1 != nullptr) {
-        fh5cam::apply_camdriver_head_rotation(reinterpret_cast<uintptr_t>(a1));
+        fh5cam::capture_active_camera(reinterpret_cast<uintptr_t>(a1));
     }
-    return ret;
+    const uint64_t n = g_posewriter_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    {   // ~1/s
+        static uint64_t s_last = 0;
+        const uint64_t now = ::GetTickCount64();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5POSEWR] calls={} a1=0x{:X} (camera captured; no scan)", n, reinterpret_cast<uintptr_t>(a1));
+        }
+    }
+    return r;
+}
+
+// UPSTREAM head-look injection: fh5_cam_LerpCameraStateStruct (RVA 0xC7F270), the per-frame camera-state
+// interpolator. Signature __fastcall(a1 = dest CAMERA, a2 = source state, a3 = lerp factor). It lerps the
+// camera's Euler angle triple into a1+0x90/0x94/0x98 from a2; sub_1407A1AC0 then reads a1+0x90 to build
+// a1+0x320 (-> producer a4). We add the head Euler POST-original (a1+0x90 = a2+0x90 + headYaw, etc.), which
+// is upstream of the +0x320 build AND — if the cull/cascade fit snapshots after this lerp — the cull too.
+using LerpCamFn = __int64(__fastcall*)(__int64, __int64, float);
+static std::unique_ptr<FunctionHook> g_lerpcam_hook;
+static __int64 __fastcall Hook_LerpCameraState(__int64 a1, __int64 a2, float a3) {
+    // INJECTION DISABLED: this lerp's a1 is a camera STATE STRUCT whose +0x90 holds non-angle data
+    // (observed base ~500/100/100), and it's transition-only. The real per-frame angle setter is
+    // sub_140DC9770 (Hook_FollowCamAngles). Keep this hook installed for diagnostics only.
+    auto original = g_lerpcam_hook->get_original<LerpCamFn>();
+    return original(a1, a2, a3);
+}
+
+// PER-FRAME camera-follow orientation setter sub_140DC9770 (RVA 0xDC9770; user RE 2026-06-06). a1(rcx) =
+// CAMERA; writes camera+0x90/0x94/0x98 (Euler angle triple) EVERY frame from its a3 input. This is upstream
+// of sub_1407A1AC0 (reads +0x90 -> builds +0x320 -> producer a4) AND the cull/cascade fit — the candidate
+// single point that makes view + culling + shadows all follow head-look. We add the head Euler POST-original
+// (base = the freshly-written cam+0x90, so apply_lerp_angle_head_rotation(a1,a1) = base + headEuler); the
+// setter rewrites the base each frame, so no accumulation. Call-counter confirms it's steady-state (climbs
+// every frame like [FH5POSEWR]) vs transition-only (stays ~0).
+using FollowCamFn = void*(__fastcall*)(void*, void*, void*, void*);
+static std::unique_ptr<FunctionHook> g_followcam_hook;
+static std::atomic<uint64_t> g_followcam_calls{ 0 };
+static void* __fastcall Hook_FollowCamAngles(void* a1, void* a2, void* a3, void* a4) {
+    auto original = g_followcam_hook->get_original<FollowCamFn>();
+    void* r = original(a1, a2, a3, a4);
+    const uint64_t n = g_followcam_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool applied = (a1 != nullptr) &&
+        fh5cam::apply_lerp_angle_head_rotation(reinterpret_cast<uintptr_t>(a1), reinterpret_cast<uintptr_t>(a1));
+    {   // ~1/s: confirm steady-state (calls climb) + injection applied
+        static uint64_t s_last = 0;
+        const uint64_t now = ::GetTickCount64();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5FOLLOWCAM] calls={} a1=0x{:X} applied={}", n, reinterpret_cast<uintptr_t>(a1), applied ? 1 : 0);
+        }
+    }
+    return r;
 }
 
 bool Fh5Adapter::install_hooks() {
@@ -599,6 +711,71 @@ bool Fh5Adapter::install_hooks() {
         }
     } else {
         spdlog::warn("[FH5] camera pose getter prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)", aim);
+    }
+
+    // a4-assembler sub_1407AC2D0 (RVA 0x7AC2D0) — builds the GAMEPLAY camera's a4 (+0x550) from the CMultiCam
+    // view-source. Prologue: push rbx; sub rsp,0x50; mov rbx,rcx; call ... (rel32 wildcarded -> verify first 10).
+    const uintptr_t a4asm = memory::module_base() + 0x7AC2D0;
+    static const unsigned char kA4AsmPrologue[] = {
+        0x40,0x53, 0x48,0x83,0xEC,0x50, 0x48,0x8B,0xD9, 0xE8
+    };
+    // DISABLED (2026-06-06): Lane A is a runtime no-op (a4 ← +0x320 on every camera live), so this hook has
+    // no purpose; not installing it removes its per-frame S+0x650 read (an AV source while driving).
+    if (false && BytesMatchSEH(a4asm, kA4AsmPrologue, sizeof(kA4AsmPrologue))) {
+        g_a4asm_hook = std::make_unique<FunctionHook>(Address{ a4asm }, &Hook_A4Assembler);
+        if (!g_a4asm_hook->create()) {
+            g_a4asm_hook.reset();
+            spdlog::warn("[FH5] a4-assembler hook create failed");
+        } else {
+            spdlog::info("[FH5] a4-assembler hook installed @0x{:X} (prologue verified)", a4asm);
+        }
+    } else {
+        spdlog::warn("[FH5] a4-assembler prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)", a4asm);
+    }
+
+    // Per-frame +0x320 WRITER sub_1407A1AC0 (RVA 0x7A1AC0) — FOUND via x64dbg HW-write-bp on the live
+    // active-camera +0x320: this function commits the full camera-to-world 4x4 to camera+0x320 (movups
+    // [rdi],xmm0 @0x7A1DE7 etc., rdi=cam+0x320, rbx/rcx=camera) on the camera-update worker thread, BEFORE
+    // the render pass copies +0x320 into the producer a4 and fits the shadow cascades. It's the only +0x320
+    // writer the bp caught for the active camera, and has a clean entry prologue. Rotate the active camera's
+    // +0x320 POST-original here so a4 AND the cascades follow head-look.
+    const uintptr_t posewriter = memory::module_base() + 0x7A1AC0;
+    static const unsigned char kPoseWriterPrologue[] = {
+        0x48,0x8B,0xC4, 0x48,0x89,0x58,0x08, 0x48,0x89,0x70,0x10, 0x48,0x89,0x78,0x18,
+        0x4C,0x89,0x70,0x20, 0x55, 0x48,0x8D,0x68,0xC8, 0x48,0x81,0xEC,0x30,0x01,0x00,0x00
+    };
+    if (BytesMatchSEH(posewriter, kPoseWriterPrologue, sizeof(kPoseWriterPrologue))) {
+        g_posewriter_hook = std::make_unique<FunctionHook>(Address{ posewriter }, &Hook_PoseWriter);
+        if (!g_posewriter_hook->create()) {
+            g_posewriter_hook.reset();
+            spdlog::warn("[FH5] +0x320 pose-writer hook create failed");
+        } else {
+            spdlog::info("[FH5] +0x320 pose-writer hook installed @0x{:X} (sub_1407A1AC0, prologue verified)", posewriter);
+        }
+    } else {
+        spdlog::warn("[FH5] +0x320 pose-writer prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)", posewriter);
+    }
+
+    // UPSTREAM head-look lever: fh5_cam_LerpCameraStateStruct (RVA 0xC7F270, named in the decompile — a
+    // verified function start, so no byte gate needed). Hooking it lets us add the head Euler to the camera
+    // angle triple +0x90/0x94/0x98 upstream of the +0x320 build and (hopefully) the cull/cascade fit.
+    const uintptr_t lerpcam = memory::module_base() + 0xC7F270;
+    g_lerpcam_hook = std::make_unique<FunctionHook>(Address{ lerpcam }, &Hook_LerpCameraState);
+    if (!g_lerpcam_hook->create()) {
+        g_lerpcam_hook.reset();
+        spdlog::warn("[FH5] LerpCameraStateStruct hook create failed @0x{:X}", lerpcam);
+    } else {
+        spdlog::info("[FH5] LerpCameraStateStruct hook installed @0x{:X} (fh5_cam_LerpCameraStateStruct)", lerpcam);
+    }
+
+    // PER-FRAME camera-follow angle setter sub_140DC9770 (RVA 0xDC9770) — THE upstream injection point.
+    const uintptr_t followcam = memory::module_base() + 0xDC9770;
+    g_followcam_hook = std::make_unique<FunctionHook>(Address{ followcam }, &Hook_FollowCamAngles);
+    if (!g_followcam_hook->create()) {
+        g_followcam_hook.reset();
+        spdlog::warn("[FH5] follow-cam angle hook create failed @0x{:X}", followcam);
+    } else {
+        spdlog::info("[FH5] follow-cam angle hook installed @0x{:X} (sub_140DC9770)", followcam);
     }
 
     return ok;
