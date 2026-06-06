@@ -628,8 +628,13 @@ static void* __fastcall Hook_FollowCamAngles(void* a1, void* a2, void* a3, void*
     auto original = g_followcam_hook->get_original<FollowCamFn>();
     void* r = original(a1, a2, a3, a4);
     const uint64_t n = g_followcam_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool applied = (a1 != nullptr) &&
-        fh5cam::apply_lerp_angle_head_rotation(reinterpret_cast<uintptr_t>(a1), reinterpret_cast<uintptr_t>(a1));
+    // INJECTION DISABLED (2026-06-06): sub_140DC9770 is the RIG/template camera (base angles 96/58/44, NOT
+    // the rendered camera's radians — confirmed [FH5LERP]). Harmless no-op while the published head delta was
+    // identity (rot=a4), but under rot=angle (mode 3) the delta is non-identity, so apply_lerp_angle_head_rotation
+    // started READING+WRITING this transient rig object every off-center frame — a first-chance-AV risk that
+    // NVIDIA's overlay VEH escalates to a crash ([[fh5-nvidia-veh-crash]]). The rendered camera is handled by
+    // apply_angle_head_rotation_prewrite in the sub_1407A1AC0 hook; this decoy is no longer needed.
+    const bool applied = false;
     {   // ~1/s: confirm steady-state (calls climb) + injection applied
         static uint64_t s_last = 0;
         const uint64_t now = ::GetTickCount64();
