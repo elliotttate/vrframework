@@ -7,6 +7,7 @@
 // session->spaces->swapchains->locate->endframe sequence, proven against SimXR).
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -49,6 +50,26 @@ static Matrix4x4f create_projection(const XrFovf& fov, float nearz, float farz) 
     m[3][2] = (farz * nearz) / (farz - nearz);
 
     return m;
+}
+
+static bool has_space_flags(XrSpaceLocationFlags flags, XrSpaceLocationFlags mask) {
+    return (flags & mask) == mask;
+}
+
+static bool has_view_flags(XrViewStateFlags flags, XrViewStateFlags mask) {
+    return (flags & mask) == mask;
+}
+
+static bool finite_position(const XrVector3f& p) {
+    return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+}
+
+static XrVector3f midpoint(const XrVector3f& a, const XrVector3f& b) {
+    return {
+        (a.x + b.x) * 0.5f,
+        (a.y + b.y) * 0.5f,
+        (a.z + b.z) * 0.5f,
+    };
 }
 
 VRRuntime::Error OpenXR::synchronize_frame() {
@@ -142,9 +163,55 @@ VRRuntime::Error OpenXR::update_poses() {
         return (VRRuntime::Error)result;
     }
 
+    const auto raw_flags = this->view_space_location.locationFlags;
+    const auto raw_position = this->view_space_location.pose.position;
+    const bool raw_pose_valid = has_space_flags(raw_flags,
+        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+        finite_position(raw_position);
+
+    XrVector3f stage_mid{};
+    bool stage_pose_valid = false;
+    if (this->stage_views.size() >= 2 &&
+        has_view_flags(this->stage_view_state.viewStateFlags,
+            XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        const auto& left = this->stage_views[0].pose;
+        const auto& right = this->stage_views[1].pose;
+        stage_mid = midpoint(left.position, right.position);
+        stage_pose_valid = finite_position(stage_mid);
+        if (stage_pose_valid) {
+            this->view_space_location.pose.orientation = left.orientation;
+            this->view_space_location.pose.position = stage_mid;
+            this->view_space_location.locationFlags |=
+                XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        }
+    }
+
+    const bool final_pose_valid = has_space_flags(this->view_space_location.locationFlags,
+        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+        finite_position(this->view_space_location.pose.position);
+
+    {
+        static auto s_last_pose_log = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (s_last_pose_log.time_since_epoch().count() == 0 ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - s_last_pose_log).count() >= 1000) {
+            s_last_pose_log = now;
+            const auto& final_position = this->view_space_location.pose.position;
+            spdlog::info("[VR-POSE] rawFlags=0x{:X} stageFlags=0x{:X} finalFlags=0x{:X} rawValid={} stageValid={} finalValid={} rawPos=({:.4f},{:.4f},{:.4f}) stageMid=({:.4f},{:.4f},{:.4f}) finalPos=({:.4f},{:.4f},{:.4f})",
+                static_cast<uint64_t>(raw_flags),
+                static_cast<uint64_t>(this->stage_view_state.viewStateFlags),
+                static_cast<uint64_t>(this->view_space_location.locationFlags),
+                raw_pose_valid ? 1 : 0,
+                stage_pose_valid ? 1 : 0,
+                final_pose_valid ? 1 : 0,
+                raw_position.x, raw_position.y, raw_position.z,
+                stage_mid.x, stage_mid.y, stage_mid.z,
+                final_position.x, final_position.y, final_position.z);
+        }
+    }
+
     if (!this->got_first_valid_poses) {
-        this->got_first_valid_poses = (this->view_space_location.locationFlags &
-            (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) != 0;
+        this->got_first_valid_poses = final_pose_valid;
     }
 
     this->needs_pose_update = false;

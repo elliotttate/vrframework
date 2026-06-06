@@ -2,14 +2,14 @@
 
 // FH5 downstream camera-constant-buffer stereo hook.
 //
-// WHY THIS EXISTS (the load-bearing discovery): FH5 renders camera-relative. The upstream view
-// producer (sub_140BB1EE0) takes a4 = camera-to-world; ROTATING a4 rotates the rendered camera
-// (culling-correct), but TRANSLATING a4.row3 (the world camera position) does NOT move the camera —
-// it cancels, because world geometry is submitted relative to the same camera position the view
-// subtracts. Proven live: dt=[0,0,300] produced zero on-screen movement; a 40-unit IPD produced zero
-// stereo disparity. So per-eye translation (IPD) and 6-DOF head translation CANNOT be done upstream.
+// WHY THIS EXISTS: FH5 renders camera-relative. The upstream view producer (sub_140BB1EE0) takes
+// a4 = camera-to-world; ROTATING a4 rotates the rendered camera, but TRANSLATING a4.row3 does not move
+// the camera because that position is already rebased higher up. Later live testing also showed the
+// active camera driver's +0x320 pose is not sufficient for visible/culling-coherent translation. The
+// current Empress RE candidate is CCamDriver+0x540, consumed by sub_1407A6300 before derived matrices.
+// This downstream cbuffer hook remains a bring-up/diagnostic fallback.
 //
-// The fix (see _agent_reports/fh5_stereo_cbuffer_spec.md): edit the already-derived 6912-byte camera
+// Fallback mechanism (see _agent_reports/fh5_stereo_cbuffer_spec.md): edit the already-derived 6912-byte camera
 // constant buffer in place, AFTER camera-relative rebasing, applying a VIEW-SPACE lateral offset to the
 // camera-relative view-projection (camRelVP@0x100). Because the geometry is already baked relative to the
 // ORIGINAL camera, pre-translating the eye in view space re-projects that fixed geometry from a laterally
@@ -46,10 +46,28 @@ unsigned long long buffers_tracked();
 unsigned long long cam_hits();
 unsigned long long cbv6912_count();
 
-// Live-tuning values from the control file (E:\tmp\fh5vr_ctl.txt): half-IPD in FH5 units and the
-// head-translation units-per-metre. apply_stereo reads these so IPD/scale can be swept without a rebuild.
+// Live-tuning values from the control file (E:\tmp\fh5vr_ctl.txt): half-IPD in metres and the
+// FH5 camera-lane units-per-metre scale. apply_stereo reads these so IPD/scale can be swept without a rebuild.
 float ctl_half_ipd();
 float ctl_world_scale();
+int   ctl_recenter_seq();
+int   ctl_rotation_mode();        // 0=off, 1=producer a4, 2=CCamDriver +0x320
+bool  ctl_projection_enabled();   // true = replace producer a7 with per-eye OpenXR projection
+
+enum PosLane : int {
+    kPosLaneCcam320 = 0,       // active camera +0x320/+0x360
+    kPosLaneCcam320D550 = 1,   // +0x320/+0x360 plus raw f64 +0x550 mirror
+    kPosLaneClone0 = 2,        // diagnostic: first matrix clone only
+    kPosLaneClone1 = 3,
+    kPosLaneClone2 = 4,
+    kPosLaneDownstream = 5,    // diagnostic: final 6912B camera cbuffer only
+    kPosLaneOff = 6,
+    kPosLaneViewTail = 7,      // active +0x320 plus first clone with a valid view-tail
+    kPosLaneInput540 = 8,      // CCamDriver +0x540 additive camera-space input lane
+    kPosLaneProducerA15 = 9,   // producer sub_140BB1EE0 a15/a16 f64 world cameraPos (Empress RE: the true lever)
+};
+int ctl_pos_lane();
+const char* pos_lane_name(int lane);
 
 // UPSTREAM camera-translation test (constant camera-relative offset applied in the producer hook to find
 // which argument is the real camera-position lever, with shadows/derived data following). tgt: 0=off,

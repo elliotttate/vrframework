@@ -1,26 +1,71 @@
 #pragma once
 
+#include <cstdint>
+#include <cstddef>
+
 // FH5 UPSTREAM camera-position writer (CCamDriver+0x320).
 //
 // WHY THIS EXISTS: the per-frame view producer (sub_140BB1EE0) is camera-relative, so TRANSLATING its
 // camera-to-world argument does NOT move the rendered camera (geometry is submitted relative to the same
-// position the view subtracts — it cancels; proven live, see Fh5CameraCbuffer.hpp). To move the camera
-// UPSTREAM so shadows/culling/chevrons follow, we must write the ENGINE's OWN camera matrix one level
-// higher: the active CCamDriver's camera-to-world pose at +0x320 (row-major: right=m[0..2], up=m[4..6],
-// forward=m[8..10], position=m[12..14]) plus its inverse view-tail at +0x3E0.
+// position the view subtracts — it cancels; proven live, see Fh5CameraCbuffer.hpp). The old +0x320 writer
+// remains as a diagnostic, but the current Empress RE says true translation input is CCamDriver+0x540:
+// a camera-space additive offset consumed by sub_1407A6300 before the engine derives +0x550/+0x320.
 //
 // Mechanism (ported from the proven standalone freecam FH5CameraProbe/src/CamDriverMatrixFreecamDll.cpp,
-// which moved the FH5 camera coherently): a background worker resolves the ForzaMultiCam singleton ONCE by
-// scanning process memory for its vtable, then ~every 4 ms reads the active CCamDriver, applies the
-// camera-relative offset published via the control file (fh5cb::ctl_up_* with tgt=driver), and writes the
-// modified +0x320 pose + recomputed +0x3E0 view-tail back. The offset is applied to the engine's FRESH
-// per-frame pose (no accumulation): the engine recomputes the base each frame as the car moves.
+// which moved the FH5 camera coherently): camera hooks publish either the live CCamDriver pointer directly
+// or the live ForzaMultiCam object from the state bridge when the build has a matching AOB. On builds where
+// those AOBs are absent, the worker can resolve the active camera object by matching +0x320 against the
+// proven view/projection producer's live pose hint. A background worker retains the older +0x320/clone
+// diagnostic lanes; the current Empress translation test writes +0x540 inside the camera-build hook.
 
 namespace fh5cam {
 
-// Idempotent. Launches the background worker thread once (resolve-then-poll). Safe to call repeatedly;
-// only the first call starts the thread. No input handling — the offset comes solely from the control
-// file via fh5cb::ctl_up_* and is applied ONLY when fh5cb::ctl_up_tgt() == 5 ("driver").
+// Idempotent. Launches the background worker thread once. Safe to call repeatedly;
+// only the first call starts the thread.
 void start();
+
+// Called by the deterministic sub_1406BE3A0 hook. `object` is the concrete CCamDriver pointer whose
+// +0x320 matrix is being published by the engine this frame.
+void publish_driver(uintptr_t object);
+
+// Called by the deterministic sub_140746BB0 bridge hook. `object` is the ForzaMultiCam object; the worker
+// reads its active camera slot at +0x5C8/+0x5D0 and validates the concrete camera matrix before writing.
+void publish_multicam(uintptr_t object);
+
+// Called by the proven view/projection producer hook for the main camera. This gives the worker a live
+// camera-basis hint so it can resolve the active +0x320 camera object by shape when build-specific
+// CCamDriver/ForzaMultiCam hooks are unavailable.
+void publish_pose_hint(const float* matrix16);
+
+// Called by the OpenXR adapter once per eye/frame. The offset is in the same camera-local units as the
+// manual upstream test: +strafe = camera right, +up = camera up, +fwd = camera forward. `delta9_rowmajor`
+// is the relative head rotation in the same row-vector basis: rows are right/up/forward.
+void publish_openxr_pose(float strafe,
+                         float up,
+                         float fwd,
+                         const float* delta9_rowmajor,
+                         int eye,
+                         bool active);
+
+// Called by the sub_1407A6300 hook at function entry. If poslane=input540 is active, writes the current
+// manual/OpenXR camera-space translation into `object + 0x540` immediately before the engine consumes it.
+void on_input540_fold(uintptr_t object);
+
+// Camera-LOCAL translation offset (manual tgt=driver + published OpenXR head/IPD pose), summed, ungated by
+// pos_lane. Axes: x=right, y=up, z=forward (engine world units). Used by the producer a15/a16 f64 cameraPos
+// hook (poslane=proda15). Returns false when there is no active, finite, non-trivial offset.
+bool current_local_offset(float& strafe, float& up, float& fwd);
+
+// Called by the producer hook with pointer-looking arguments. If an argument is already the active camera
+// object, a shared-pointer control block, a ForzaMultiCam object, or a wrapper containing one, this captures
+// the concrete camera object without process-wide scanning.
+void publish_candidate_pointer(uintptr_t value, const float* matrix16);
+
+// Best-effort current active-camera class name for the menu navigator's world3d disambiguation:
+//   "CCamFollowLow"/"CCamFollowHigh"/"CCamHood"/"CCamBumperHigh"/"CCamDriver" = free-roam DRIVING views,
+//   "CCamFollowExtended" = garage/menu extended-follow, "CCamFree*" = photo/free, "CCamDriver" = cockpit.
+// Reads the active camera object resolved by the upstream writer (populated while it is active, i.e. during
+// 3D scenes); writes "unknown" if not yet resolved. Always null-terminates within `cap`.
+void active_camera_name(char* out, size_t cap);
 
 } // namespace fh5cam

@@ -18,6 +18,7 @@
 
 #include "Framework.hpp"
 #include "Fh5CameraCbuffer.hpp"
+#include "Fh5MenuNav.hpp"
 
 // --- dxgi.dll proxy export forwarding (-> dxgi_real.dll) --------------------------------------------
 // Same ordinal-stable set the probe uses; the renderer calls CreateDXGIFactory* which forward through.
@@ -63,6 +64,10 @@ DWORD WINAPI bootstrap(void*) {
     // camera-cbuffer buffer-tracking hooks install at device creation and catch the camera ring's
     // allocation (it is created during render init, before any later producer-triggered install).
     fh5cb::install_createdevice_hook(d3d12);
+
+    // Install the XInput detour early so the menu navigator can inject controller input during the
+    // title/menu flow — before the engine seam (and Fh5MenuNav::start) come up. Idempotent; start() retries.
+    fh5nav::install_xinput_hook();
 
     // Construct the framework. Its ctor hooks D3D12 present and runs the frame-init state machine;
     // the first present drives Mods init -> Fh5Adapter::install_hooks() (the producer detour).

@@ -35,13 +35,17 @@ std::atomic<bool>  g_active{ false };
 // ---------------------------------------------------------------------------
 // Live-tuning control file: E:\tmp\fh5vr_ctl.txt, polled by a worker thread, so
 // IPD / world-scale / transform-mode can be swept WITHOUT a rebuild (the audit's
-// Phase 0). Lines: "ipd=0.032" (half-IPD in FH5 units), "scale=100" (head-trans
-// units/metre), "mode=off|camrel|viewvp|all".
+// Phase 0). Lines: "ipd=0.032" (half-IPD metres), "scale=100" (FH5 camera-lane
+// units/metre), "mode=off|camrel|viewvp|all", "poslane=input540|ccam320|viewtail|clone0|...".
 // ---------------------------------------------------------------------------
-std::atomic<float> g_ctl_half_ipd{ 3.15f };
-std::atomic<float> g_ctl_world_scale{ 100.0f };
+std::atomic<float> g_ctl_half_ipd{ 0.0f };
+std::atomic<float> g_ctl_world_scale{ 1.0f };
 std::atomic<int>   g_ctl_mode{ 3 };   // 0=off 1=camrel_only 2=view_vp_only 3=all
+std::atomic<int>   g_ctl_rot_mode{ 2 }; // 0=off 1=producer a4 2=CCamDriver+0x320
+std::atomic<bool>  g_ctl_projection{ true };
+std::atomic<int>   g_ctl_pos_lane{ kPosLaneProducerA15 };   // Empress RE: producer a15/a16 f64 cameraPos is the lever (+0x540 proved inert live)
 std::atomic<bool>  g_ctl_started{ false };
+std::atomic<int>   g_ctl_recenter_seq{ 0 };
 
 // UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
 // argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
@@ -56,6 +60,7 @@ void poll_control_file() {
         float v; int iv;
         if (sscanf_s(line, "ipd=%f", &v) == 1)          g_ctl_half_ipd.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "scale=%f", &v) == 1)   g_ctl_world_scale.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "recenter=%d", &iv) == 1) g_ctl_recenter_seq.store(iv, std::memory_order_relaxed);
         else if (sscanf_s(line, "fwd=%f", &v) == 1)     g_ctl_fwd.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "strafe=%f", &v) == 1)  g_ctl_strafe.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "up=%f", &v) == 1)      g_ctl_up.store(v, std::memory_order_relaxed);
@@ -65,6 +70,37 @@ void poll_control_file() {
             else if (strncmp(line + 5, "viewvp", 6) == 0) iv = 2;
             else                                          iv = 3;
             g_ctl_mode.store(iv, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "rot=", 4) == 0) {
+            if      (strncmp(line + 4, "off", 3)    == 0) iv = 0;
+            else if (strncmp(line + 4, "a4", 2)     == 0) iv = 1;
+            else if (strncmp(line + 4, "driver", 6) == 0) iv = 2;
+            else                                          iv = 2;
+            g_ctl_rot_mode.store(iv, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "proj=", 5) == 0) {
+            const bool enabled =
+                strncmp(line + 5, "on", 2) == 0 ||
+                strncmp(line + 5, "1", 1) == 0 ||
+                strncmp(line + 5, "true", 4) == 0;
+            g_ctl_projection.store(enabled, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "poslane=", 8) == 0) {
+            if      (strncmp(line + 8, "proda15", 7)        == 0) iv = kPosLaneProducerA15;
+            else if (strncmp(line + 8, "a15", 3)            == 0) iv = kPosLaneProducerA15;
+            else if (strncmp(line + 8, "input540", 8)       == 0) iv = kPosLaneInput540;
+            else if (strncmp(line + 8, "ccam540", 7)        == 0) iv = kPosLaneInput540;
+            else if (strncmp(line + 8, "viewtail", 8)       == 0) iv = kPosLaneViewTail;
+            else if (strncmp(line + 8, "ccam320_viewtail", 16) == 0) iv = kPosLaneViewTail;
+            else if (strncmp(line + 8, "ccam320_d550", 13) == 0) iv = kPosLaneCcam320D550;
+            else if (strncmp(line + 8, "ccam320", 7)       == 0) iv = kPosLaneCcam320;
+            else if (strncmp(line + 8, "clone0", 6)        == 0) iv = kPosLaneClone0;
+            else if (strncmp(line + 8, "clone1", 6)        == 0) iv = kPosLaneClone1;
+            else if (strncmp(line + 8, "clone2", 6)        == 0) iv = kPosLaneClone2;
+            else if (strncmp(line + 8, "downstream", 10)   == 0) iv = kPosLaneDownstream;
+            else if (strncmp(line + 8, "off", 3)           == 0) iv = kPosLaneOff;
+            else                                                   iv = kPosLaneCcam320;
+            g_ctl_pos_lane.store(iv, std::memory_order_relaxed);
         }
         else if (strncmp(line, "tgt=", 4) == 0) {
             if      (strncmp(line + 4, "off", 3)    == 0) iv = 0;
@@ -85,13 +121,18 @@ DWORD WINAPI ControlThread(void*) {
         poll_control_file();
         const int m = g_ctl_mode.load(std::memory_order_relaxed);
         const int tgt = g_ctl_tgt.load(std::memory_order_relaxed);
+        const int rot = g_ctl_rot_mode.load(std::memory_order_relaxed);
+        const bool proj = g_ctl_projection.load(std::memory_order_relaxed);
+        const int poslane = g_ctl_pos_lane.load(std::memory_order_relaxed);
         const int sig = m * 100000 + tgt * 10000
+            + rot * 1000 + (proj ? 500 : 0) + poslane
             + (int)(g_ctl_half_ipd.load(std::memory_order_relaxed) * 100)
             + (int)(g_ctl_fwd.load(std::memory_order_relaxed) + g_ctl_strafe.load(std::memory_order_relaxed));
         if (sig != last_logged) {
             last_logged = sig;
-            spdlog::info("[FH5CTL] ipd={:.3f} scale={:.1f} mode={} | UPSTREAM tgt={} fwd={:.1f} strafe={:.1f} up={:.1f}",
-                         g_ctl_half_ipd.load(), g_ctl_world_scale.load(), m, tgt,
+            spdlog::info("[FH5CTL] ipd={:.3f} scale={:.1f} mode={} rot={} proj={} poslane={} | UPSTREAM tgt={} fwd={:.1f} strafe={:.1f} up={:.1f}",
+                         g_ctl_half_ipd.load(), g_ctl_world_scale.load(), m, rot, proj ? 1 : 0,
+                         pos_lane_name(poslane), tgt,
                          g_ctl_fwd.load(), g_ctl_strafe.load(), g_ctl_up.load());
         }
         Sleep(300);
@@ -383,12 +424,37 @@ void set_eye_offset(float view_x, float view_y, float view_z, bool active) {
     g_off_z.store(view_z, std::memory_order_relaxed);
     g_active.store(active, std::memory_order_relaxed);
     if (!g_ctl_started.exchange(true)) {   // start the live-tuning control-file poller once
-        if (HANDLE t = CreateThread(nullptr, 0, &ControlThread, nullptr, 0, nullptr)) CloseHandle(t);
+        if (HANDLE t = CreateThread(nullptr, 0, &ControlThread, nullptr, 0, nullptr)) {
+            CloseHandle(t);
+            spdlog::info("[FH5CTL] control-file poller started");
+        } else {
+            g_ctl_started.store(false);
+            spdlog::warn("[FH5CTL] failed to start control-file poller");
+        }
     }
 }
 
 float ctl_half_ipd()    { return g_ctl_half_ipd.load(std::memory_order_relaxed); }
 float ctl_world_scale() { return g_ctl_world_scale.load(std::memory_order_relaxed); }
+int   ctl_recenter_seq(){ return g_ctl_recenter_seq.load(std::memory_order_relaxed); }
+int   ctl_rotation_mode(){ return g_ctl_rot_mode.load(std::memory_order_relaxed); }
+bool  ctl_projection_enabled(){ return g_ctl_projection.load(std::memory_order_relaxed); }
+int   ctl_pos_lane()    { return g_ctl_pos_lane.load(std::memory_order_relaxed); }
+const char* pos_lane_name(int lane) {
+    switch (lane) {
+    case kPosLaneCcam320: return "ccam320";
+    case kPosLaneCcam320D550: return "ccam320_d550";
+    case kPosLaneClone0: return "clone0";
+    case kPosLaneClone1: return "clone1";
+    case kPosLaneClone2: return "clone2";
+    case kPosLaneDownstream: return "downstream";
+    case kPosLaneOff: return "off";
+    case kPosLaneViewTail: return "viewtail";
+    case kPosLaneInput540: return "input540";
+    case kPosLaneProducerA15: return "proda15";
+    default: return "unknown";
+    }
+}
 float ctl_up_fwd()      { return g_ctl_fwd.load(std::memory_order_relaxed); }
 float ctl_up_strafe()   { return g_ctl_strafe.load(std::memory_order_relaxed); }
 float ctl_up_up()       { return g_ctl_up.load(std::memory_order_relaxed); }

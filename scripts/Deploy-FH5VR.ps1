@@ -6,11 +6,11 @@
 #      falling back to copying System32\dxgi.dll as dxgi_real.dll when the game dir has none,
 #   2. copies the freshly built FH5VR.dll in as dxgi.dll,
 #   3. drops the dynamic-loaded OpenXR loader next to the exe,
-#   4. points XR_RUNTIME_JSON at the OpenXR Simulator (validate stereo headless) unless -RealRuntime.
+#   4. clears XR_RUNTIME_JSON by default so the system OpenXR runtime is used; -SimRuntime opts into SimXR.
 #
 # Usage:
-#   pwsh scripts/Deploy-FH5VR.ps1                 # SimXR runtime (default)
-#   pwsh scripts/Deploy-FH5VR.ps1 -RealRuntime    # leave XR_RUNTIME_JSON to the system OpenXR runtime
+#   pwsh scripts/Deploy-FH5VR.ps1                 # system OpenXR runtime
+#   pwsh scripts/Deploy-FH5VR.ps1 -SimRuntime     # set User XR_RUNTIME_JSON to SimXR
 #   pwsh scripts/Deploy-FH5VR.ps1 -Undo           # restore dxgi_real.dll -> dxgi.dll, remove staged files
 
 param(
@@ -20,6 +20,7 @@ param(
     [string]$LoaderDll = "E:\Github\tapir-unreal-engine\Engine\Binaries\ThirdParty\OpenXR\win64\openxr_loader.dll",
     [string]$SimJson   = "E:\Github\OpenXR-Simulator\bin\openxr_simulator.json",
     [switch]$RealRuntime,
+    [switch]$SimRuntime,
     [switch]$Undo
 )
 
@@ -67,13 +68,17 @@ if (Test-Path $LoaderDll) {
 }
 
 # 4. Runtime selection.
-if ($RealRuntime) {
-    Write-Host "RealRuntime: leaving XR_RUNTIME_JSON as-is (system OpenXR runtime)."
-} elseif (Test-Path $SimJson) {
+if ($SimRuntime) {
+    if (-not (Test-Path $SimJson)) { throw "SimXR json not found at $SimJson" }
     [Environment]::SetEnvironmentVariable("XR_RUNTIME_JSON", $SimJson, "User")
     Write-Host "XR_RUNTIME_JSON (User) -> $SimJson  (SimXR; restart the launcher to inherit)"
 } else {
-    Write-Warning "SimXR json not found at $SimJson"
+    [Environment]::SetEnvironmentVariable("XR_RUNTIME_JSON", $null, "User")
+    if ($RealRuntime) {
+        Write-Host "RealRuntime: cleared User XR_RUNTIME_JSON; system OpenXR runtime will be used."
+    } else {
+        Write-Host "cleared User XR_RUNTIME_JSON; system OpenXR runtime will be used."
+    }
 }
 
 Write-Host "`nDeploy complete. Launch FH5; FH5VR.log lands beside the exe. Undo with -Undo."

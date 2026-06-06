@@ -20,6 +20,8 @@
 #include "Fh5Adapter.hpp"
 #include "Fh5CameraCbuffer.hpp"
 #include "Fh5CamDriver.hpp"
+#include "Fh5MenuNav.hpp"
+#include "Fh5UiScreen.hpp"
 
 #include <Framework.hpp>
 #include <mods/VR.hpp>
@@ -111,6 +113,7 @@ inline Mat4 BuildA(float p, float y, float r) {
 // copy the engine backbuffer into the matching eye swapchain — so the copied eye is always the eye the
 // producer actually rendered, eliminating the parity desync that made both eyes identical.
 std::atomic<int> g_fh5_applied_eye{ 0 };
+std::atomic<uint64_t> g_fh5_applied_eye_ms{ 0 };
 
 // ---------------------------------------------------------------------------
 // The 25-arg producer detour. Lifted from FH5CameraProbe/src/DxgiProxy.cpp (proven live), generalized
@@ -124,8 +127,16 @@ static std::unique_ptr<FunctionHook> g_producer_hook;
 
 // Diagnostics: producer call rate, main-camera gate passes, frames we actually injected.
 static std::atomic<uint64_t> g_prodCalls{ 0 }, g_prodMainHits{ 0 }, g_engagedHits{ 0 };
-// CCamDriver pose-hook diagnostics (defined here so the producer heartbeat can read them).
-static std::atomic<uint64_t> g_camdriverCalls{ 0 }, g_camdriverApplied{ 0 };
+static std::atomic<uint64_t> g_viewWrites{ 0 }, g_projWrites{ 0 };
+// Camera pointer-capture diagnostics (defined here so the producer heartbeat can read them).
+static std::atomic<uint64_t> g_camdriverCalls{ 0 }, g_bridgeCalls{ 0 };
+// Most-recent gameplay-camera near/far (set under the is_main gate) for the menu navigator's scene class.
+static std::atomic<float> g_lastNear{ 0.0f }, g_lastFar{ 0.0f };
+// Recency timestamps (GetTickCount64 ms) of the last is_main frame in each far bucket. The producer renders
+// SEVERAL main cameras per frame (live test: a far~5000 gameplay cam AND a far~50000 intro/cinematic cam
+// alternate), so a single last_far flaps. The navigator instead classifies by RECENCY: showcase is "sticky"
+// while ANY far>30000 frame is recent (intro running); world3d only once the far>30000 camera fully stops.
+static std::atomic<uint64_t> g_lastShowcaseMs{ 0 }, g_lastWorldMs{ 0 };
 
 static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, double a5, void* a6,
     void* a7, float a8, float a9, void* a10, int a11, unsigned a12, __int64 a13, void* a14, double a15,
@@ -153,9 +164,11 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     // far-1000 shadow pass while catching the real camera regardless of its far value.
     const bool is_main = (a8 > 0.06f && a8 < 0.2f && a9 > 2000.0f);
 
-    // Unconditional diagnostic: confirms the hook fires AT ALL and surfaces each camera's near/far so we
-    // can see why is_main isn't matching (e.g. the menu/intro camera uses different near/far than gameplay).
-    if ((calls % 500) == 1) {
+    // Diagnostic: confirms the hook fires and surfaces each camera's near/far without flooding the log.
+    static uint64_t s_last_producer_diag_ms = 0;
+    const uint64_t producer_diag_now_ms = ::GetTickCount64();
+    if (producer_diag_now_ms - s_last_producer_diag_ms >= 5000) {
+        s_last_producer_diag_ms = producer_diag_now_ms;
         spdlog::info("[FH5] producer fired: calls={} mainHits={} | near(a8)={:.4f} far(a9)={:.1f} is_main={}",
             calls, g_prodMainHits.load(), a8, a9, is_main);
     }
@@ -165,19 +178,59 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     // updates g_stereo for THIS frame's eye BEFORE we snapshot it below. No-op until VR wires the
     // timeline callbacks (and they early-out until the OpenXR runtime is ready).
     if (is_main) {
+        g_lastNear.store(a8, std::memory_order_relaxed);   // gameplay-camera planes for the nav scene class
+        g_lastFar.store(a9, std::memory_order_relaxed);
+        const uint64_t nowtick = GetTickCount64();          // recency-bucket the far plane (is_main => far>2000)
+        if (a9 > 30000.0f) g_lastShowcaseMs.store(nowtick, std::memory_order_relaxed);
+        else               g_lastWorldMs.store(nowtick, std::memory_order_relaxed);
+        if (a4 != nullptr) {
+            const float* pose_hint = reinterpret_cast<const float*>(a4);
+            fh5cam::publish_pose_hint(pose_hint);
+#if 0
+            // Disabled while stabilizing startup: these are useful for finding the active camera object
+            // without a process-wide scan, but probing every producer argument can perturb menu/driver
+            // startup on the Empress/NVIDIA path before the gameplay camera is live.
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a1), pose_hint);
+            fh5cam::publish_candidate_pointer(static_cast<uintptr_t>(a2), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a4), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a6), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a7), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a10), pose_hint);
+            fh5cam::publish_candidate_pointer(static_cast<uintptr_t>(a13), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a14), pose_hint);
+            fh5cam::publish_candidate_pointer(static_cast<uintptr_t>(a16), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a17), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a18), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a20), pose_hint);
+            fh5cam::publish_candidate_pointer(reinterpret_cast<uintptr_t>(a21), pose_hint);
+            fh5cam::publish_candidate_pointer(static_cast<uintptr_t>(a25), pose_hint);
+#endif
+        }
         const uint64_t hits = g_prodMainHits.fetch_add(1, std::memory_order_relaxed) + 1;
         // The VR frame cadence (eye parity + apply_stereo) is driven ONCE per present from
         // VR::on_post_present — NOT here. The producer fires many times per frame, so reporting the
         // timeline here would scramble the L/R parity (-> both eyes identical). The producer's only job
         // is to APPLY the latched g_stereo below.
         // Log on eye CHANGE (not a modulo, which aliases to one parity) so we can confirm L/R alternates.
+        // Throttle this because the producer can fire dozens of times per frame; otherwise it hides the
+        // camera-driver hook evidence we need during bring-up.
         static int s_last_logged_eye = -1;
+        static uint64_t s_last_prod_log_ms = 0;
         StereoState dbg{}; const bool act = snapshot_stereo(dbg);
-        if (dbg.eye_idx != s_last_logged_eye) {
+        const uint64_t now_ms = ::GetTickCount64();
+        if (dbg.eye_idx != s_last_logged_eye && now_ms - s_last_prod_log_ms >= 1000) {
             s_last_logged_eye = dbg.eye_idx;
-            spdlog::info("[FH5] main={} eye={} | cbuf writes={} | camDriver calls={} applied={}",
-                hits, dbg.eye_idx, fh5cb::ring_writes(),
-                g_camdriverCalls.load(std::memory_order_relaxed), g_camdriverApplied.load(std::memory_order_relaxed));
+            s_last_prod_log_ms = now_ms;
+            spdlog::info("[FH5] main={} eye={} | view writes={} proj writes={} | cbuf writes={} hits={} cbv6912={} buffers={} | camDriver captures={} bridge captures={}",
+                hits, dbg.eye_idx,
+                g_viewWrites.load(std::memory_order_relaxed),
+                g_projWrites.load(std::memory_order_relaxed),
+                fh5cb::ring_writes(),
+                fh5cb::cam_hits(),
+                fh5cb::cbv6912_count(),
+                fh5cb::buffers_tracked(),
+                g_camdriverCalls.load(std::memory_order_relaxed),
+                g_bridgeCalls.load(std::memory_order_relaxed));
         }
     }
 
@@ -186,12 +239,15 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     if (engaged) {
         g_engagedHits.fetch_add(1, std::memory_order_relaxed);
         g_fh5_applied_eye.store(s.eye_idx, std::memory_order_release);   // stamp eye for the D3D12 copy
+        g_fh5_applied_eye_ms.store(::GetTickCount64(), std::memory_order_release);
     }
 
     float saved_view[16];  bool did_view = false;
     float saved_proj[16];  bool did_proj = false;
     float saved_a17[4];    bool did_a17 = false;
     float saved_a18[4];    bool did_a18 = false;
+    double saved_w15[3];   double* w15 = nullptr;   // producer a15 f64 world-cameraPos (poslane=proda15)
+    double saved_w16[3];   double* w16 = nullptr;   // producer a16 f64 world-cameraPos (prev-frame pair)
 
     if (engaged) {
         __try {
@@ -234,12 +290,42 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
 
             std::memcpy(a4, Mp.m, 64);
             did_view = true;
+            g_viewWrites.fetch_add(1, std::memory_order_relaxed);
+
+            // ---- a15/a16: the TRUE upstream world-position lever (poslane=proda15). Empress RE: the producer
+            //      reads the camera WORLD position as DOUBLE-precision from the pointers a15(bits)->f64[4] and
+            //      a16->f64[4]; it splits those into the camera-relative rebasing origin (cameraPos@+0x80) that
+            //      ALL geometry/culling/shadows are rebased against. a4.row3/a17/a18 are inert because they are
+            //      post-rebasing. Shift the f64 world pos along the rotated camera basis (Mp rows: right/up/fwd);
+            //      restore after the trampoline (engine re-derives the source next frame -> compose-on-top). ----
+            if (fh5cb::ctl_pos_lane() == fh5cb::kPosLaneProducerA15) {
+                float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+                if (fh5cam::current_local_offset(lx, ly, lz)) {
+                    const float* b = Mp.m;
+                    const double wx = (double)(lx * b[0] + ly * b[4] + lz * b[8]);
+                    const double wy = (double)(lx * b[1] + ly * b[5] + lz * b[9]);
+                    const double wz = (double)(lx * b[2] + ly * b[6] + lz * b[10]);
+                    double* p15 = *reinterpret_cast<double**>(&a15);
+                    if (p15 != nullptr) {
+                        saved_w15[0] = p15[0]; saved_w15[1] = p15[1]; saved_w15[2] = p15[2];
+                        p15[0] += wx; p15[1] += wy; p15[2] += wz;
+                        w15 = p15;
+                    }
+                    double* p16 = reinterpret_cast<double*>(a16);
+                    if (p16 != nullptr) {
+                        saved_w16[0] = p16[0]; saved_w16[1] = p16[1]; saved_w16[2] = p16[2];
+                        p16[0] += wx; p16[1] += wy; p16[2] += wz;
+                        w16 = p16;
+                    }
+                }
+            }
 
             // ---- a7: per-eye asymmetric projection (optional; parallax-only when disabled) ----
             if (s.write_proj && a7 != nullptr) {
                 std::memcpy(saved_proj, a7, 64);
                 std::memcpy(a7, s.proj, 64);
                 did_proj = true;
+                g_projWrites.fetch_add(1, std::memory_order_relaxed);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             did_view = did_proj = false;
@@ -254,6 +340,8 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
     if (did_proj) { __try { std::memcpy(a7, saved_proj, 64); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     if (did_a17)  { __try { std::memcpy(a17, saved_a17, 16); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     if (did_a18)  { __try { std::memcpy(a18, saved_a18, 16); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (w15)      { __try { w15[0]=saved_w15[0]; w15[1]=saved_w15[1]; w15[2]=saved_w15[2]; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (w16)      { __try { w16[0]=saved_w16[0]; w16[1]=saved_w16[1]; w16[2]=saved_w16[2]; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,13 +363,10 @@ EngineCaps Fh5Adapter::capabilities() const {
 }
 
 // ---------------------------------------------------------------------------
-// CCamDriver pose-publisher hook (sub_1406BE3A0, RVA 0x6BE3A0). a1 = CCamDriver object; a1+0x320 is the
-// row-major camera-to-world matrix (right@m0..2, up@m4..6, fwd@m8..10, POSITION@m12..14) that feeds FH5's
-// camera-relative rebasing — the TRUE upstream camera-position lever (the producer's a4/a17/a18 are
-// post-rebasing and proven inert). Proven by the standalone freecam (FH5CameraProbe/src/
-// CamDriverMatrixFreecamDll.cpp) which moves the rendered camera coherently by writing this exact lane.
-// We add a camera-relative offset to the position, recompute the inverse view-tail at +0x3E0, let the
-// original publish it, then restore the object so the engine's next frame starts from a clean base.
+// CCamDriver pose-publisher hook (sub_1406BE3A0, RVA 0x6BE3A0 on older builds). a1 = CCamDriver object;
+// a1+0x320 is a row-major camera-to-world matrix that is useful for object identification and old
+// diagnostics, but current Empress testing says it is not the authoritative translation input. The hook
+// only captures the live object pointer; the current input-lane test is sub_1407A6300 / +0x540.
 // ---------------------------------------------------------------------------
 using CamDriverFn = __int64(__fastcall*)(__int64, __int64);
 static std::unique_ptr<FunctionHook> g_camdriver_hook;
@@ -289,43 +374,61 @@ static std::unique_ptr<FunctionHook> g_camdriver_hook;
 static __int64 __fastcall Hook_CamDriver(__int64 a1, __int64 a2) {
     auto original = g_camdriver_hook->get_original<CamDriverFn>();
     g_camdriverCalls.fetch_add(1, std::memory_order_relaxed);
-
-    float saved320[16]; float saved3E0[16];
-    bool did = false; bool did_vt = false;
-    if (fh5cb::ctl_up_tgt() == 5 && a1 != 0) {
-        __try {
-            float* m = reinterpret_cast<float*>(a1 + 0x320);
-            auto len3 = [](const float* v) { return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); };
-            const float lr = len3(&m[0]), lu = len3(&m[4]), lf = len3(&m[8]);
-            const bool ortho = lr > 0.9f && lr < 1.1f && lu > 0.9f && lu < 1.1f && lf > 0.9f && lf < 1.1f
-                && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]);
-            if (ortho) {
-                const float fwd = fh5cb::ctl_up_fwd(), strafe = fh5cb::ctl_up_strafe(), up = fh5cb::ctl_up_up();
-                std::memcpy(saved320, m, 64);
-                // camera-relative offset along the rotated basis (right/up/forward), into the position row.
-                m[12] += strafe*m[0] + up*m[4] + fwd*m[8];
-                m[13] += strafe*m[1] + up*m[5] + fwd*m[9];
-                m[14] += strafe*m[2] + up*m[6] + fwd*m[10];
-                did = true;
-                // recompute the inverse view-tail at +0x3E0 (world->camera): translation = -dot(pos, axis).
-                float* vt = reinterpret_cast<float*>(a1 + 0x3E0);
-                if (std::isfinite(vt[12]) && std::isfinite(vt[13]) && std::isfinite(vt[14])) {
-                    std::memcpy(saved3E0, vt, 64); did_vt = true;
-                    const float px = m[12], py = m[13], pz = m[14];
-                    vt[12] = -(px*m[0] + py*m[1] + pz*m[2]);
-                    vt[13] = -(px*m[4] + py*m[5] + pz*m[6]);
-                    vt[14] = -(px*m[8] + py*m[9] + pz*m[10]);
-                }
-                g_camdriverApplied.fetch_add(1, std::memory_order_relaxed);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { did = did_vt = false; }
+    if (a1 != 0) {
+        fh5cam::publish_driver(static_cast<uintptr_t>(a1));
     }
+    return original(a1, a2);
+}
 
-    const __int64 r = original(a1, a2);
+// ForzaMultiCam state bridge (sub_140746BB0, RVA 0x746BB0). a1 is the bridge/wrapper object; [a1+0x198]
+// is the live ForzaMultiCam object whose +0x5C8/+0x5D0 active-camera shared pointer gives the concrete
+// camera object. This is the deterministic replacement for the old process-wide ForzaMultiCam vtable scan.
+using BridgeFn = char(__fastcall*)(__int64);
+static std::unique_ptr<FunctionHook> g_bridge_hook;
 
-    if (did)    { __try { std::memcpy(reinterpret_cast<void*>(a1 + 0x320), saved320, 64); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
-    if (did_vt) { __try { std::memcpy(reinterpret_cast<void*>(a1 + 0x3E0), saved3E0, 64); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
-    return r;
+static char __fastcall Hook_Bridge(__int64 a1) {
+    auto original = g_bridge_hook->get_original<BridgeFn>();
+    g_bridgeCalls.fetch_add(1, std::memory_order_relaxed);
+    if (a1 != 0) {
+        __try {
+            const uintptr_t multicam = *reinterpret_cast<const uintptr_t*>(a1 + 0x198);
+            if (multicam != 0) {
+                fh5cam::publish_multicam(multicam);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return original(a1);
+}
+
+// CCamDriver additive input fold (sub_1407A6300, Empress RVA 0x7A6300). This is the current best
+// translation lever from Empress IDA: the function consumes `this+0x540` as a camera-space additive
+// offset, derives `+0x550/+0x570`, then folds the result into the final camera matrix.
+using Input540FoldFn = void(__fastcall*)(__int64);
+static std::unique_ptr<FunctionHook> g_input540_fold_hook;
+
+static void __fastcall Hook_Input540Fold(__int64 self) {
+    if (self != 0) {
+        fh5cam::on_input540_fold(static_cast<uintptr_t>(self));
+    }
+    auto original = g_input540_fold_hook->get_original<Input540FoldFn>();
+    original(self);
+}
+
+// SEH-guarded byte compare (no C++ object unwinding here, so __try is legal — install_hooks holds
+// unique_ptrs and cannot use __try directly). Verifies a function prologue before a raw-RVA inline hook.
+static bool BytesMatchSEH(uintptr_t addr, const unsigned char* expected, size_t n) {
+    if (addr == 0 || expected == nullptr || n == 0) return false;
+    __try {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(addr);
+        for (size_t i = 0; i < n; ++i) {
+            if (p[i] != expected[i]) {
+                return false;
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 bool Fh5Adapter::install_hooks() {
@@ -342,18 +445,56 @@ bool Fh5Adapter::install_hooks() {
     g_producer_hook = std::make_unique<FunctionHook>(Address{ addr }, &Hook_Producer);
     const bool ok = g_producer_hook->create();
 
-    // CCamDriver pose publisher (sub_1406BE3A0, RVA 0x6BE3A0): prologue `40 53 48 83 EC 20 48 81 C1 20 03
-    // 00 00 48 8B DA E8` (the `48 81 C1 20 03 00 00` = add rcx,0x320 is the unique anchor). Upstream lever.
+    // CCamDriver pose publisher. Do not use an RVA fallback here: the known 0x6BE3A0 address belongs to a
+    // different build than the live Empress 1.405 test exe, and a stale hook target is worse than no hook.
     const uintptr_t cd = memory::FuncRelocation(
         "fh5_ccamdriver_publish",
         "40 53 48 83 EC 20 48 81 C1 20 03 00 00 48 8B DA E8",
-        /*fallback RVA*/ 0x6BE3A0);
+        /*fallback RVA*/ 0);
     if (cd != 0) {
         g_camdriver_hook = std::make_unique<FunctionHook>(Address{ cd }, &Hook_CamDriver);
         if (!g_camdriver_hook->create()) { g_camdriver_hook.reset(); spdlog::warn("[FH5] CCamDriver hook create failed"); }
         else spdlog::info("[FH5] CCamDriver pose hook installed @0x{:X}", cd);
     } else {
         spdlog::warn("[FH5] CCamDriver AOB not found");
+    }
+
+    // ForzaMultiCam state bridge. Do not use an RVA fallback here either; the bridge AOB is absent from the
+    // live Empress 1.405 exe, so a fallback would hook unrelated code.
+    const uintptr_t br = memory::FuncRelocation(
+        "fh5_forzamulticam_state_bridge",
+        "48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B B9 88 01 00 00 48 8B D9 8B B1 90 01 00 00 48 C7 44 24 30 00 00 00 00 48 85 FF 74 09 48 8B 07 48 8B CF FF 50 10 44 8B C6 48 89 7C 24 30 48 8D",
+        /*fallback RVA*/ 0);
+    if (br != 0) {
+        g_bridge_hook = std::make_unique<FunctionHook>(Address{ br }, &Hook_Bridge);
+        if (!g_bridge_hook->create()) { g_bridge_hook.reset(); spdlog::warn("[FH5] ForzaMultiCam bridge hook create failed"); }
+        else spdlog::info("[FH5] ForzaMultiCam bridge hook installed @0x{:X}", br);
+    } else {
+        spdlog::warn("[FH5] ForzaMultiCam bridge AOB not found");
+    }
+
+    // CCamDriver additive-fold sub_1407A6300 @ Empress RVA 0x7A6300 (no ASLR; base 0x140000000). Because
+    // this is a raw-RVA target (no FuncRelocation AOB), VERIFY the function prologue before inline-hooking it:
+    // a wrong target (build/base drift) would otherwise corrupt arbitrary code and crash. Prologue bytes are
+    // from the Empress IDA RE (fh5_empress_camera_input_lanes_RE.md); the unique in-body anchor for scanners is
+    // 0F 10 86 40 05 00 00 0F 58 86 30 05 00 00 at function+0x82 (movups xmm0,[r14+540h]; addps [r14+530h]).
+    const uintptr_t input540 = memory::module_base() + 0x7A6300;
+    static const unsigned char kFoldPrologue[] = {
+        0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x48,0x89,0x7C,0x24,0x18,
+        0x41,0x56, 0x48,0x83,0xEC,0x50, 0x4C,0x8B,0xF1
+    };
+    const bool input540_prologue_ok = BytesMatchSEH(input540, kFoldPrologue, sizeof(kFoldPrologue));
+    if (input540_prologue_ok) {
+        g_input540_fold_hook = std::make_unique<FunctionHook>(Address{ input540 }, &Hook_Input540Fold);
+        if (!g_input540_fold_hook->create()) {
+            g_input540_fold_hook.reset();
+            spdlog::warn("[FH5] CCamDriver +0x540 input-fold hook create failed");
+        } else {
+            spdlog::info("[FH5] CCamDriver +0x540 input-fold hook installed @0x{:X} (prologue verified)", input540);
+        }
+    } else {
+        spdlog::warn("[FH5] CCamDriver +0x540 input-fold prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)",
+                     input540);
     }
 
     return ok;
@@ -370,64 +511,130 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     //                      orientation. Applied to a4 in the producer (culling-correct). Using the per-eye
     //                      view[eye] before baked the eye offset + any per-eye canting into a4 -> the eyes
     //                      ended up at different angles. The IPD is a pure lateral offset, NOT a rotation.
-    //   * HEAD TRANSLATION + per-eye IPD — applied DOWNSTREAM in view space (Fh5CameraCbuffer), because
-    //                      a4.row3 (world camera position) cancels under FH5's camera-relative rendering.
+    //   * HEAD TRANSLATION + per-eye IPD — published to the selected position lane. The current Empress
+    //                      input-lane candidate is CCamDriver+0x540 (poslane=input540); +0x320 and clone
+    //                      lanes are retained as diagnostics.
     //
-    // Tracking source = view[eye], NOT hmd_transform: SimXR's xrLocateSpace(view,local) does NOT track head
-    // TRANSLATION (stays 0), but xrLocateViews (which fills view[eye]) does. The PER-EYE recenter below
-    // subtracts the constant eye offset, so Hrel is the pure head delta (rotation + translation) and is the
-    // SAME for both eyes (eye_to_head has no rotation) — that's what keeps the two eyes at the same angle.
-    const glm::mat4 H = view.view[eye];
+    // Tracking source = the single HMD pose. The runtime now synthesizes hmd_transform from stage-space
+    // xrLocateViews when xrLocateSpace(view, stage) omits translation, so we do not need to derive head
+    // motion from per-eye view matrices. Using view[eye] here bakes eye-to-head into Hrel; pure pitch/roll
+    // then creates fake translation and the two eyes drift apart.
+    const glm::mat4 H = view.hmd_transform;
 
-    // Recenter against this eye's first-frame rest pose so the unmoved head -> identity AND the constant eye
-    // offset cancels. (set_head_pose seats the head at y=1.7; recentering keeps the camera at the engine's
-    // normal position at rest.) The explicit IPD below is the ONLY per-eye difference.
-    static glm::mat4 s_rest[2]; static bool s_rest_set[2]{ false, false };
-    if (!s_rest_set[eye]) { s_rest[eye] = H; s_rest_set[eye] = true; }
-    const glm::mat4 Hrel = glm::affineInverse(s_rest[eye]) * H;
+    // Recenter against the first-frame HMD rest pose so the unmoved head -> identity. The explicit IPD below
+    // is the only per-eye difference.
+    static glm::mat4 s_rest{ 1.0f };
+    static bool s_rest_set = false;
+    static int s_last_recenter_seq = 0;
+    const int recenter_seq = fh5cb::ctl_recenter_seq();
+    const bool do_recenter = !s_rest_set || (recenter_seq > 0 && recenter_seq != s_last_recenter_seq);
+    if (do_recenter) {
+        s_rest = H;
+        s_rest_set = true;
+        s_last_recenter_seq = recenter_seq;
+        spdlog::info("[FH5POSE] recentered HMD rest pose seq={}", recenter_seq);
+    }
+    const glm::mat4 Hrel = glm::affineInverse(s_rest) * H;
 
     // Basis B = diag(1,1,-1): OpenXR (-z fwd) -> FH5 a4 (+z fwd). Conjugate the head rotation by B.
     constexpr glm::mat4 B{ 1.0f,0.0f,0.0f,0.0f,  0.0f,1.0f,0.0f,0.0f,  0.0f,0.0f,-1.0f,0.0f,  0.0f,0.0f,0.0f,1.0f };
     const glm::mat3 R_eng = glm::mat3(B) * glm::mat3(Hrel) * glm::mat3(B);   // head rotation in engine axes
 
-    // a4 delta = rotation ONLY (no translation upstream — it cancels). Shared across eyes below.
+    // Build the relative head rotation in ForzaTech's row-vector camera basis. Rotation stays on the proven
+    // producer/driver path; translation/IPD is published as a camera-space vector and consumed by whichever
+    // position lane is selected in the control file.
     glm::mat4 Gfix{ R_eng };
     Gfix[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
     s.ipd_units = 0.0f;
     s.eye_idx = eye;
 
     // Head translation in engine REST-frame axes (B relabels OpenXR->engine; recenter aligned rest with the
-    // engine camera). units/metre comes from the live control file (default 100) so it can be swept.
+    // engine camera). The CCamDriver pose-writer path consumes metre-scale units; the live scale remains sweepable.
     const float ws = fh5cb::ctl_world_scale();
     const glm::vec3 head_t = glm::mat3(B) * glm::vec3(Hrel[3]) * ws;   // (right, up, forward) in engine units
 
-    // The downstream hook converts the offset through the CURRENT (head-rotated) camera axes. The IPD must
-    // ride those rotated axes (lateral to where you look), but the head translation is in the REST frame, so
-    // pre-rotate it by R_eng^T to cancel the producer's rotation -> it lands in the rest/engine frame.
+    // Downstream cbuffer math used the CURRENT head-rotated camera axes. Keep that value only as a diagnostic
+    // comparison; the active upstream writer below applies offsets through the source CCamDriver basis.
     const glm::vec3 head_t_local = glm::transpose(R_eng) * head_t;
 
-    // SYMMETRIC stereo: share ONE head pose (rotation + translation) across both eyes, computed from the
-    // LEFT eye, so the ONLY per-eye difference is the symmetric ±IPD. Deriving the head pose per-eye from
-    // view[eye] leaks an asymmetric component (the eye-offset conjugation under head rotation, and any
-    // per-eye recenter drift) -> the eyes drifted to different positions. This forces them symmetric.
-    static glm::mat4 s_head_delta{ 1.0f }; static glm::vec3 s_head_off{ 0.0f }; static bool s_head_set = false;
-    if (view.current_render_eye == StereoView::Eye::LEFT || !s_head_set) {
-        s_head_delta = Gfix; s_head_off = head_t_local; s_head_set = true;
+    // SYMMETRIC stereo: share ONE head pose (rotation + translation) across both eyes, so the ONLY per-eye
+    // difference is the symmetric ±IPD. Keep the left-eye latch under AFR so both eyes in the pair consume
+    // the same sampled HMD pose.
+    static glm::mat4 s_head_delta{ 1.0f };
+    static glm::vec3 s_head_off_cbuf{ 0.0f };
+    static glm::vec3 s_head_off_driver{ 0.0f };
+    static bool s_head_set = false;
+    if (do_recenter) {
+        s_head_delta = glm::mat4{ 1.0f };
+        s_head_off_cbuf = glm::vec3{ 0.0f };
+        s_head_off_driver = glm::vec3{ 0.0f };
+        s_head_set = false;
     }
-    std::memcpy(s.delta, &s_head_delta[0][0], 64);   // shared rotation for the producer (both eyes identical)
-
-    // Half-IPD in FH5 units, LIVE from the control file (sweep 0, 0.032, 0.10, 3.15 to find the right scale
-    // without rebuilding). 0 -> both eyes identical (alignment baseline).
+    if (view.current_render_eye == StereoView::Eye::LEFT || !s_head_set) {
+        s_head_delta = Gfix;
+        s_head_off_cbuf = head_t_local;
+        s_head_off_driver = head_t;
+        s_head_set = true;
+    }
+    // Half-IPD is stored in metres, like OpenXR head translation. Convert it with the same live scale so
+    // `ipd=0.032 scale=100` reproduces the earlier visible ~3.2 FH5-unit stereo offset, while scale=1 keeps
+    // true metre-scale diagnostics available.
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
-    const float half_ipd = ipd_sign * fh5cb::ctl_half_ipd();
-    const glm::vec3 off = s_head_off + glm::vec3(half_ipd, 0.0f, 0.0f);   // shared head + symmetric per-eye IPD
-    fh5cb::set_eye_offset(off.x, off.y, off.z, /*active=*/true);
+    const float half_ipd = ipd_sign * fh5cb::ctl_half_ipd() * ws;
+    const glm::vec3 cbuf_off = s_head_off_cbuf + glm::vec3(half_ipd, 0.0f, 0.0f);
+
+    // Rotation path is live-selectable:
+    //   rot=driver (default): write head rotation into the upstream CCamDriver pose so shadows/derived
+    //                         camera systems see the same pose.
+    //   rot=a4:              old bring-up path; rotate only the main producer argument.
+    //   rot=off:             diagnostic.
+    // Translation/IPD stays on the selected upstream lane unless poslane=downstream/off.
+    float head_delta16[16]{};
+    std::memcpy(head_delta16, &s_head_delta[0][0], sizeof(head_delta16));
+    constexpr float identity16[16]{
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        0,0,0,1
+    };
+    const int requested_rot_mode = fh5cb::ctl_rotation_mode();
+    const int pos_lane = fh5cb::ctl_pos_lane();
+    // The +0x540 lane is a translation input only. Keep rot=driver as the public default, but route
+    // rotation through the known-live producer hook while +0x540 owns upstream translation.
+    const int rot_mode =
+        ((pos_lane == fh5cb::kPosLaneInput540 || pos_lane == fh5cb::kPosLaneProducerA15) &&
+         requested_rot_mode == 2) ? 1 : requested_rot_mode;
+    const bool upstream_position =
+        pos_lane != fh5cb::kPosLaneDownstream &&
+        pos_lane != fh5cb::kPosLaneOff;
+    const bool downstream_position = pos_lane == fh5cb::kPosLaneDownstream;
+    const float* producer_delta = (rot_mode == 1) ? head_delta16 : identity16;
+    const float* driver_delta   = (rot_mode == 2) ? head_delta16 : identity16;
+    std::memcpy(s.delta, producer_delta, sizeof(s.delta));
+    const glm::vec3 head_right_axis{ head_delta16[0], head_delta16[1], head_delta16[2] };
+    const glm::vec3 driver_off_full = s_head_off_driver + head_right_axis * half_ipd;
+    const glm::vec3 driver_off = upstream_position ? driver_off_full : glm::vec3{ 0.0f };
+    const float delta9[9]{
+        driver_delta[0], driver_delta[1], driver_delta[2],
+        driver_delta[4], driver_delta[5], driver_delta[6],
+        driver_delta[8], driver_delta[9], driver_delta[10],
+    };
+    fh5cam::publish_openxr_pose(driver_off.x, driver_off.y, driver_off.z, delta9, eye,
+                                pos_lane != fh5cb::kPosLaneOff);
+
+    // Downstream is now an explicit positive-control lane. It is not the final architecture, but it tells us
+    // whether the current simulator offset would be visible if the final camera cbuffer were patched.
+    fh5cb::set_eye_offset(cbuf_off.x, cbuf_off.y, cbuf_off.z, downstream_position);
 
     {   // ~1/s diagnostic: head delta + per-eye offset
         static std::atomic<uint32_t> dcount{ 0 };
         if ((dcount.fetch_add(1, std::memory_order_relaxed) % 90) == 0) {
-            spdlog::info("[FH5POSE] eye={} headT(units)=[{:.2f} {:.2f} {:.2f}] off=[{:.2f} {:.2f} {:.2f}] halfIPD={:.2f}",
-                eye, head_t.x, head_t.y, head_t.z, off.x, off.y, off.z, half_ipd);
+            spdlog::info("[FH5POSE] eye={} headT(units)=[{:.3f} {:.3f} {:.3f}] driverOff=[{:.3f} {:.3f} {:.3f}] cbufOff=[{:.3f} {:.3f} {:.3f}] halfIPD={:.3f} rotMode={}->{} proj={} poslane={}",
+                eye, head_t.x, head_t.y, head_t.z,
+                driver_off.x, driver_off.y, driver_off.z,
+                cbuf_off.x, cbuf_off.y, cbuf_off.z, half_ipd,
+                requested_rot_mode, rot_mode, fh5cb::ctl_projection_enabled() ? 1 : 0,
+                fh5cb::pos_lane_name(pos_lane));
         }
     }
 
@@ -437,7 +644,7 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     {
         const glm::mat4 P = glm::transpose(view.projection[eye]);  // -> row-vector layout
         std::memcpy(s.proj, &P[0][0], 64);
-        s.write_proj = false;   // TODO: enable after SimXR validate_stereo confirms frustum layout/sign
+        s.write_proj = fh5cb::ctl_projection_enabled();
     }
 
     publish_stereo(s);
@@ -472,6 +679,14 @@ std::optional<std::string> Fh5Adapter::on_initialize() {
     // Start the UPSTREAM camera-pose writer (polls the active CCamDriver+0x320; gated to tgt=driver). This
     // is the proven lever that moves the rendered camera coherently (shadows/culling/chevrons follow).
     fh5cam::start();
+    // Start the menu navigator: publishes live flow state to E:\tmp\fh5_state.txt and injects controller
+    // input from E:\tmp\fh5_nav.txt (the in-process, image-free path to free-roam). XInput is also hooked
+    // from the dllmain bootstrap; start() retries the hook in case xinput loaded late.
+    fh5nav::start();
+    // Start the live UI screen detector (read-only heap scan for known UIPage controller vtables) so the
+    // navigator gets a real `screen=` (e.g. CopterHud=free-roam HUD, Loading, PauseMenuTiled) — the breadcrumb
+    // is crash-only and the active-page dispatcher can't be hooked statically.
+    fh5ui::start();
     return std::nullopt;
 }
 
@@ -491,3 +706,20 @@ void Fh5Adapter::on_config_load(const utility::Config& cfg, bool set_defaults) {
 void Fh5Adapter::on_config_save(utility::Config& cfg) {
     for (IModValue& opt : m_options) opt.config_save(cfg);
 }
+
+// ---------------------------------------------------------------------------
+// Producer diagnostics for the menu navigator (Fh5MenuNav reads these to publish flow state).
+// ---------------------------------------------------------------------------
+namespace fh5diag {
+uint64_t producer_calls()     { return g_prodCalls.load(std::memory_order_relaxed); }
+uint64_t producer_main_hits() { return g_prodMainHits.load(std::memory_order_relaxed); }
+float    last_near()          { return g_lastNear.load(std::memory_order_relaxed); }
+float    last_far()           { return g_lastFar.load(std::memory_order_relaxed); }
+uint64_t last_showcase_ms()   { return g_lastShowcaseMs.load(std::memory_order_relaxed); }
+uint64_t last_world_ms()      { return g_lastWorldMs.load(std::memory_order_relaxed); }
+int      applied_eye()        { return g_fh5_applied_eye.load(std::memory_order_acquire); }
+uint64_t applied_eye_ms()     { return g_fh5_applied_eye_ms.load(std::memory_order_acquire); }
+uint64_t engaged_hits()       { return g_engagedHits.load(std::memory_order_relaxed); }
+uint64_t view_writes()        { return g_viewWrites.load(std::memory_order_relaxed); }
+uint64_t projection_writes()  { return g_projWrites.load(std::memory_order_relaxed); }
+} // namespace fh5diag

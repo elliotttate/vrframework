@@ -15,6 +15,7 @@
 #include <Mod.hpp>
 #include <memory>
 #include <atomic>
+#include <cstdint>
 
 class Fh5Adapter : public IEngineAdapter {
 public:
@@ -48,3 +49,21 @@ private:
     const ModToggle::Ptr m_disable_taa{ ModToggle::create("FH5_DisableTAA", true) };
     ValueList m_options{ *m_ipd_scale, *m_world_scale, *m_disable_taa };
 };
+
+// Producer-hook diagnostics, exposed for the menu navigator's flow-state publisher (Fh5MenuNav). The
+// producer fires many times per frame; main_hits counts ONLY the gameplay-camera passes (near~0.1, far>2000),
+// so its rate of change tells the orchestrator whether a 3D gameplay camera is actively rendering. last_near/
+// last_far are the most recent gameplay-camera planes (scene classification: world vs showcase).
+namespace fh5diag {
+uint64_t producer_calls();
+uint64_t producer_main_hits();
+float    last_near();
+float    last_far();
+uint64_t last_showcase_ms();   // GetTickCount64 ms of the last far>30000 main frame (intro/showcase recency)
+uint64_t last_world_ms();      // GetTickCount64 ms of the last far in (2000,30000] main frame (world recency)
+int      applied_eye();
+uint64_t applied_eye_ms();
+uint64_t engaged_hits();
+uint64_t view_writes();
+uint64_t projection_writes();
+} // namespace fh5diag

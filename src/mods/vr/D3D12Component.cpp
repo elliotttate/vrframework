@@ -7,6 +7,7 @@
 #include "Framework.hpp"
 #include "mods/VR.hpp"
 #include "mods/vr/D3D12Component.hpp"
+#include "../../fh5vr/Fh5Adapter.hpp"
 
 namespace vrmod {
 
@@ -162,27 +163,56 @@ bool D3D12Component::on_frame(VR* vr) {
     // SpriteBatch blit here. Omitted in this scaffold; FH5's validated backbuffer is 8-bit.
     auto eye_texture = backbuffer.Get();
 
-    // AFR eye selection. Use the VR per-present render eye (m_render_eye, advanced once per present in
-    // VR::on_post_present) — this is ALWAYS driven, including at menus. The adapter's g_fh5_applied_eye
-    // stamp is only set while the main camera is being injected (is_main), so keying the begin/end cadence
-    // off it stalls submission whenever the gameplay camera isn't active (blank SimXR at menus). At
-    // gameplay both agree (the producer applies the same per-present-latched eye), so this stays correct
-    // for stereo while restoring reliable submission everywhere.
-    const int applied_eye = (int)vr->get_current_render_eye();   // 0=LEFT, 1=RIGHT
+    // Eye selection has two modes:
+    //   * gameplay: use the fresh producer stamp, because it names the eye the engine camera actually
+    //     rendered. This prevents AER phase drift when menus/reset reorder present vs producer timing.
+    //   * menus/loading: fall back to AFR parity so the OpenXR preview keeps receiving frames even when
+    //     the gameplay-camera producer is not active.
+    const uint64_t now_for_eye_ms = ::GetTickCount64();
+    const uint64_t applied_eye_ms = fh5diag::applied_eye_ms();
+    const bool producer_eye_fresh = applied_eye_ms != 0 && (now_for_eye_ms - applied_eye_ms) <= 250;
+    const int applied_eye = producer_eye_fresh
+        ? fh5diag::applied_eye()
+        : (int)vr->get_current_render_eye();   // 0=LEFT, 1=RIGHT
 
-    // Diagnostic: log the copy-eye sequence so we can confirm consecutive presents alternate 0,1,0,1 (and
-    // thus the two swapchains receive DIFFERENT backbuffers). A stuck/duplicated eye -> both eyes identical.
+    // Diagnostic: log densely during startup/reset, then at low rate. This proves whether the producer eye,
+    // copy eye, backbuffer index, and XR begin/end state are paired instead of only sampling one line/5s.
+    uint32_t copy_seq = 0;
     {
         static std::atomic<uint32_t> s_seq{ 0 };
-        const uint32_t n = s_seq.fetch_add(1, std::memory_order_relaxed);
-        if ((n % 120) < 6) {
-            spdlog::info("[VR-COPY] present#{} applied_eye={} bbIdx={}", n, applied_eye, backbuffer_index);
+        static std::atomic<uint64_t> s_last_log_ms{ 0 };
+        copy_seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t now_ms = ::GetTickCount64();
+        uint64_t last_ms = s_last_log_ms.load(std::memory_order_relaxed);
+        if ((copy_seq < 120 || now_ms - last_ms >= 1000) &&
+            s_last_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+            spdlog::info("[VR-COPY] present#{} eye={} src={} bbIdx={} began={} synced={} shouldRender={}",
+                copy_seq, applied_eye, producer_eye_fresh ? "producer" : "parity",
+                backbuffer_index,
+                vr->m_openxr->frame_began ? 1 : 0,
+                vr->m_openxr->frame_synced ? 1 : 0,
+                vr->m_openxr->frame_state.shouldRender == XR_TRUE ? 1 : 0);
         }
     }
 
     // Begin the XR frame on the LEFT eye (first of the pair) so both copies land in a begun frame.
     if (applied_eye == 0 && !vr->m_openxr->frame_began) {
+        if (!vr->m_openxr->frame_synced) {
+            runtime->synchronize_frame();
+            runtime->update_poses();
+        }
         vr->m_openxr->begin_frame();
+    }
+
+    if (applied_eye == 1 && !vr->m_openxr->frame_began) {
+        static std::atomic<uint64_t> s_last_drop_log_ms{ 0 };
+        const uint64_t now_ms = ::GetTickCount64();
+        uint64_t last_ms = s_last_drop_log_ms.load(std::memory_order_relaxed);
+        if (now_ms - last_ms >= 1000 &&
+            s_last_drop_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+            spdlog::warn("[VR-COPY] drop unpaired right eye present#{} bbIdx={} (no begun XR frame)", copy_seq, backbuffer_index);
+        }
+        return false;
     }
 
     m_openxr.copy(vr, applied_eye, eye_texture, device, command_queue);
@@ -232,6 +262,13 @@ void D3D12Component::on_reset(VR* vr) {
 
     auto runtime = vr->get_runtime();
     if (runtime != nullptr && runtime->is_openxr() && runtime->loaded) {
+        if (vr->m_openxr != nullptr) {
+            std::scoped_lock _{vr->m_openxr->sync_mtx};
+            vr->m_openxr->frame_began = false;
+            vr->m_openxr->frame_synced = false;
+            vr->m_openxr->needs_pose_update = true;
+        }
+
         // Recreate swapchains if the HMD render size changed.
         if (m_openxr.last_resolution[0] != vr->get_hmd_width() ||
             m_openxr.last_resolution[1] != vr->get_hmd_height() ||
