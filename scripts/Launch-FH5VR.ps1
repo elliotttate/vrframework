@@ -30,9 +30,9 @@ param(
     [float]$WorldScale = 1.0,
     [Alias("Ipd")]
     [float]$HalfIpdUnits = 0.032,
-    [ValidateSet("driver","a4","off")]
-    [string]$RotationPath = "a4",   # working interim: clean yaw/pitch/roll head-look (shadows follow). "driver" = experimental upstream-rotation path.
-    [ValidateSet("proda15","input540","viewtail","ccam320","ccam320_d550","clone0","clone1","clone2","downstream","off")]
+    [ValidateSet("angle","driver","a4","off")]
+    [string]$RotationPath = "a4",   # working interim: clean yaw/pitch/roll head-look (shadows follow). "angle" = shadow-coherent cam+0x90 Euler injection (CAMERA_VR_FIX_GUIDE). "driver" = +0x320 matrix path.
+    [ValidateSet("camsrc","proda15","input540","viewtail","ccam320","ccam320_d550","clone0","clone1","clone2","downstream","off")]
     [string]$PosLane = "proda15",
     [switch]$DisableProjection
 )

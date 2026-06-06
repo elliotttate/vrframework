@@ -79,6 +79,7 @@ void poll_control_file() {
             if      (strncmp(line + 4, "off", 3)    == 0) iv = 0;
             else if (strncmp(line + 4, "a4", 2)     == 0) iv = 1;
             else if (strncmp(line + 4, "driver", 6) == 0) iv = 2;
+            else if (strncmp(line + 4, "angle", 5)  == 0) iv = 3;   // inject head Euler at cam+0x90/94/98 (upstream of view+cull+shadow)
             else                                          iv = 2;
             g_ctl_rot_mode.store(iv, std::memory_order_relaxed);
         }
@@ -90,7 +91,8 @@ void poll_control_file() {
             g_ctl_projection.store(enabled, std::memory_order_relaxed);
         }
         else if (strncmp(line, "poslane=", 8) == 0) {
-            if      (strncmp(line + 8, "proda15", 7)        == 0) iv = kPosLaneProducerA15;
+            if      (strncmp(line + 8, "camsrc", 6)         == 0) iv = kPosLaneCamSrc;
+            else if (strncmp(line + 8, "proda15", 7)        == 0) iv = kPosLaneProducerA15;
             else if (strncmp(line + 8, "a15", 3)            == 0) iv = kPosLaneProducerA15;
             else if (strncmp(line + 8, "input540", 8)       == 0) iv = kPosLaneInput540;
             else if (strncmp(line + 8, "ccam540", 7)        == 0) iv = kPosLaneInput540;
@@ -465,6 +467,7 @@ const char* pos_lane_name(int lane) {
     case kPosLaneViewTail: return "viewtail";
     case kPosLaneInput540: return "input540";
     case kPosLaneProducerA15: return "proda15";
+    case kPosLaneCamSrc: return "camsrc";
     default: return "unknown";
     }
 }

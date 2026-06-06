@@ -80,6 +80,23 @@ bool apply_active_camdriver_head_rotation();
 // cull/cascade fit. Call POST-original. Gated to rot=driver + active head delta.
 bool apply_lerp_angle_head_rotation(uintptr_t cam, uintptr_t src);
 
+// SHADOW-COHERENT 6DOF translation (the position analog of apply_angle_head_rotation_prewrite). Called from
+// the +0x320 builder hook sub_1407A1AC0 POST-original with the rendered camera (a1). Shifts the camera world
+// position in cam+0x320 ROW 3 (m[12..14], f32) along the head-rotated basis (rows 0-2) by the published head
+// translation. The shadow-cascade fit reads cam+0x320 live on the render thread (proven: it followed the
+// +0x90 rotation), so shifting row3 here rebases the cascades coherently — while poslane=camsrc keeps the
+// producer a15/a16 f64 shift for the view+instance-cull. Anti-accumulating; gated to poslane=camsrc + fresh
+// VR pose. Returns true if it wrote row3.
+bool apply_camsrc_translation_postwrite(uintptr_t cam);
+
+// SHADOW-COHERENT head-look (CAMERA_VR_FIX_GUIDE.md, the convergence-point fix). Called from the +0x320
+// builder hook sub_1407A1AC0 PRE-original with the validated rendered camera (a1). Adds the head Euler
+// (RADIANS, raw) to the camera's orientation angles cam+0x90/0x94/0x98 BEFORE the original rebuilds +0x320
+// from them — so the view (+0x320 -> producer a4) AND the render-thread cull/shadow cascade fit (which read
+// the same orientation, NOT +0x320) both rotate together. Anti-accumulating (refresh-detected clean base,
+// idempotent within a frame). Gated to rot=angle (mode 3) + poslane=proda15 + a fresh VR head pose.
+bool apply_angle_head_rotation_prewrite(uintptr_t cam);
+
 // Runtime camera-orientation probe (dumpcam / pokerot / pokerotvs control-file knobs). Called post-fold on
 // the active CCamDriver to locate + live-rotate the orientation source the shadow cascades consume.
 void probe_camera(uintptr_t object);

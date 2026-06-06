@@ -356,7 +356,10 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
             //      ALL geometry/culling/shadows are rebased against. a4.row3/a17/a18 are inert because they are
             //      post-rebasing. Shift the f64 world pos along the rotated camera basis (Mp rows: right/up/fwd);
             //      restore after the trampoline (engine re-derives the source next frame -> compose-on-top). ----
-            if (fh5cb::ctl_pos_lane() == fh5cb::kPosLaneProducerA15) {
+            // proda15 AND camsrc both shift the producer a15/a16 f64 cameraPos (moves view + instance-cull).
+            // camsrc ADDITIONALLY shifts cam+0x320 row3 in the pose-writer hook so the shadow cascades follow.
+            if (fh5cb::ctl_pos_lane() == fh5cb::kPosLaneProducerA15 ||
+                fh5cb::ctl_pos_lane() == fh5cb::kPosLaneCamSrc) {
                 float lx = 0.0f, ly = 0.0f, lz = 0.0f;
                 if (fh5cam::current_local_offset(lx, ly, lz)) {
                     const float* b = Mp.m;
@@ -553,30 +556,44 @@ static std::unique_ptr<FunctionHook> g_posewriter_hook;
 static std::atomic<uint64_t> g_posewriter_calls{ 0 };
 static void* __fastcall Hook_PoseWriter(void* a1, void* a2, void* a3, void* a4) {
     auto original = g_posewriter_hook->get_original<PoseWriterFn>();
+    // SHADOW-COHERENT head-look (rot=angle / mode 3) — the CAMERA_VR_FIX_GUIDE convergence-point fix. a1
+    // (rcx/rbx) IS the rendered CAMERA (raw disasm of sub_1407A1AC0 @0x7A1AC0). The original reads the
+    // camera's orientation Euler angles cam+0x90/94/98 (RADIANS) and rebuilds cam+0x320 (the 4x4
+    // cam-to-world) from them via Rodrigues. We add the head Euler to +0x90/94/98 HERE, PRE-original, so the
+    // original rebuilds +0x320 ALREADY head-rotated. The engine then copies +0x320 into the producer a4 (the
+    // view) AND the render-thread cull/shadow cascade fit reads the SAME orientation (NOT +0x320) — so view,
+    // culling, and shadows all rotate together from this single upstream injection (unlike the OLD +0x320
+    // matrix post-rotate, which moved the view but the cull/cascade fit read an upstream snapshot -> washout).
+    // Self-gated inside the call (mode 3 + poslane=proda15 + fresh VR pose); no-op in modes 0/1/2 and at rest.
+    bool angle_injected = false;
+    if (a1 != nullptr) {
+        angle_injected = fh5cam::apply_angle_head_rotation_prewrite(reinterpret_cast<uintptr_t>(a1));
+    }
     void* r = original(a1, a2, a3, a4);
-    // CORRECTED 2026-06-06 (raw disasm of sub_1407A1AC0 @0x7A1AC0): a1 (rcx/rbx) IS the CAMERA (this), not
-    // the ancestor. The original just wrote camera+0x320 = the 4x4 cam-to-world (from vtbl[0x60]()). We
-    // rotate THAT +0x320 here POST-write, BEFORE the render-view pass copies it into the producer a4 AND
-    // fits the shadow cascades (both derive from +0x320 live on this build). apply_camdriver_head_rotation
-    // rotates ONLY +0x320 now (the old +0x360 64-byte write corrupted a scalar FOV field = the black screen).
-    // Gated to a known camera vtable + orthonormal basis + rot=driver; no-op otherwise. This is the
-    // shadow-coherent lever: if shadows now follow head-look, +0x320 is upstream of the cascade fit.
-    // ROTATION DISABLED again (2026-06-06): post-rotating +0x320 here rotated the view (a4 follows) but the
-    // cull/cascade fit reads an UPSTREAM snapshot, so near geometry culled (washout). The rotation moved to
-    // fh5_cam_LerpCameraStateStruct (upstream of this writer's +0x90 read), so sub_1407A1AC0 now rebuilds
-    // +0x320 NATIVELY from the head-rotated angles — rotating here too would double-apply. Diagnostic only.
+    // SHADOW-COHERENT 6DOF translation (poslane=camsrc): POST-original, shift the camera world position in
+    // cam+0x320 ROW 3 along the (head-rotated) basis. The original just wrote row3 from its f64 accumulators;
+    // the shadow-cascade fit reads cam+0x320 live on the render thread, so shifting row3 here rebases the
+    // cascades coherently — while the producer a15/a16 f64 shift (Hook_Producer, also gated to camsrc) moves
+    // the view + instance-cull by the SAME world delta. No-op outside poslane=camsrc.
+    bool camsrc_shifted = false;
+    if (a1 != nullptr) {
+        camsrc_shifted = fh5cam::apply_camsrc_translation_postwrite(reinterpret_cast<uintptr_t>(a1));
+    }
     // Capture the live camera (a1) for the worker — replaces the crash-prone memory scan. AV-safe: a1 was
-    // just dereferenced by the original writer, and capture_active_camera validates before publishing.
+    // just dereferenced by the original writer, and capture_active_camera validates (now against the freshly
+    // written, head-rotated +0x320, which stays orthonormal).
     if (a1 != nullptr) {
         fh5cam::capture_active_camera(reinterpret_cast<uintptr_t>(a1));
     }
+    (void)camsrc_shifted;
     const uint64_t n = g_posewriter_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     {   // ~1/s
         static uint64_t s_last = 0;
         const uint64_t now = ::GetTickCount64();
         if (now - s_last >= 1000) {
             s_last = now;
-            spdlog::info("[FH5POSEWR] calls={} a1=0x{:X} (camera captured; no scan)", n, reinterpret_cast<uintptr_t>(a1));
+            spdlog::info("[FH5POSEWR] calls={} a1=0x{:X} angleInj={} (camera captured; no scan)",
+                         n, reinterpret_cast<uintptr_t>(a1), angle_injected ? 1 : 0);
         }
     }
     return r;
@@ -865,9 +882,13 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     const glm::vec3 cbuf_off = s_head_off_cbuf + glm::vec3(half_ipd, 0.0f, 0.0f);
 
     // Rotation path is live-selectable:
-    //   rot=driver (default): write head rotation into the upstream CCamDriver pose so shadows/derived
-    //                         camera systems see the same pose.
-    //   rot=a4:              old bring-up path; rotate only the main producer argument.
+    //   rot=angle:           SHADOW-COHERENT (CAMERA_VR_FIX_GUIDE) — inject the head Euler at the rendered
+    //                        camera's orientation angles cam+0x90/94/98 (in the sub_1407A1AC0 hook), upstream
+    //                        of the +0x320 view build AND the render-thread cull/shadow cascade fit, so all
+    //                        three rotate together.
+    //   rot=driver:          rotate the upstream CCamDriver +0x320 MATRIX (moves the view; cull/cascade fit
+    //                        reads an upstream snapshot -> shadows NOT coherent — superseded by rot=angle).
+    //   rot=a4:              bring-up path; rotate only the main producer argument (view-only, shadows follow).
     //   rot=off:             diagnostic.
     // Translation/IPD stays on the selected upstream lane unless poslane=downstream/off.
     float head_delta16[16]{};
@@ -892,7 +913,11 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
         pos_lane != fh5cb::kPosLaneOff;
     const bool downstream_position = pos_lane == fh5cb::kPosLaneDownstream;
     const float* producer_delta = (rot_mode == 1) ? head_delta16 : identity16;
-    const float* driver_delta   = (rot_mode == 2) ? head_delta16 : identity16;
+    // driver_delta carries the head rotation for mode 2 (CCamDriver +0x320 matrix) AND mode 3 (cam+0x90
+    // Euler angles) — both consume the published delta basis via SnapshotOpenXrPose. The two appliers
+    // self-gate (apply_camdriver_head_rotation -> mode 2, apply_angle_head_rotation_prewrite -> mode 3), so
+    // only one acts; the producer a4 stays identity in both (the view rotates via the rebuilt +0x320/a4).
+    const float* driver_delta   = (rot_mode == 2 || rot_mode == 3) ? head_delta16 : identity16;
     std::memcpy(s.delta, producer_delta, sizeof(s.delta));
     const glm::vec3 head_right_axis{ head_delta16[0], head_delta16[1], head_delta16[2] };
     const glm::vec3 driver_off_full = s_head_off_driver + head_right_axis * half_ipd;

@@ -2789,6 +2789,10 @@ static Matrix4 MulRowVector(const Matrix4& d, const Matrix4& m) {
 
 bool apply_camdriver_head_rotation(uintptr_t object) {
     if (object < 0x10000ull) return false;
+    // Mode 2 ONLY (rot=driver). In mode 3 (rot=angle) the head-look is injected at the orientation angles
+    // cam+0x90 instead (apply_angle_head_rotation_prewrite); rotating the +0x320 MATRIX here too would
+    // double-apply. In mode 1 (rot=a4) the producer rotates a4 directly and this path is left untouched.
+    if (fh5cb::ctl_rotation_mode() != 2) return false;
     if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return false;
 
     // Head rotation (row-vector 3x3, rows = right/up/forward) published by apply_stereo via the driver
@@ -3163,6 +3167,136 @@ bool apply_active_camdriver_head_rotation() {
     if (obj < 0x10000ull) obj = g_shape_driver_object.load(std::memory_order_acquire);
     if (obj < 0x10000ull) return false;
     return apply_camdriver_head_rotation(obj);
+}
+
+// Anti-accumulation cache for the cam+0x320 ROW-3 position shift (poslane=camsrc). The engine rewrites the
+// camera world position each frame (sub_1407A1AC0 builds cam+0x320 row3 from the f64 accumulators); we
+// detect that refresh by comparing the live row3 to our last write, so we compose the head translation onto
+// a CLEAN base (no drift on a parked camera, no double-apply on multi-call frames).
+static uintptr_t g_camsrc_obj = 0;
+static double    g_camsrc_base[3]    = { 0.0, 0.0, 0.0 };
+static double    g_camsrc_written[3] = { 0.0, 0.0, 0.0 };
+
+bool apply_camsrc_translation_postwrite(uintptr_t cam) {
+    if (cam < 0x10000ull) return false;
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneCamSrc) return false;
+
+    // Camera-local head translation (x=right, y=up, z=forward), summed manual + OpenXR head; false at rest.
+    float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+    if (!current_local_offset(lx, ly, lz)) return false;
+
+    // The cam-to-world 4x4 the original just wrote (rows 0-2 = head-rotated basis if rot=angle ran PRE-orig;
+    // row 3 = world position). Project the local offset onto the basis rows -> world delta (row-vector:
+    // worldvec = localvec * M_rot), identical to the producer a15/a16 shift so the view and the cascade move
+    // by the SAME world vector.
+    Matrix4 M{};
+    if (!SafeCopyIn(cam + kCameraMatrixOffset, M.m.data(), sizeof(float) * M.m.size())) return false;
+    const float* b = M.m.data();
+    for (int i = 0; i < 12; ++i) { if (!std::isfinite(b[i])) return false; }
+    const double wx = (double)(lx * b[0] + ly * b[4] + lz * b[8]);
+    const double wy = (double)(lx * b[1] + ly * b[5] + lz * b[9]);
+    const double wz = (double)(lx * b[2] + ly * b[6] + lz * b[10]);
+
+    const double cur[3] = { (double)b[12], (double)b[13], (double)b[14] };
+    if (!std::isfinite(cur[0]) || !std::isfinite(cur[1]) || !std::isfinite(cur[2])) return false;
+
+    // Refresh detection -> clean base (no accumulation across re-entries within a frame).
+    constexpr double kPosEps = 1e-3;
+    const bool refreshed =
+        (g_camsrc_obj != cam) ||
+        std::fabs(cur[0] - g_camsrc_written[0]) > kPosEps ||
+        std::fabs(cur[1] - g_camsrc_written[1]) > kPosEps ||
+        std::fabs(cur[2] - g_camsrc_written[2]) > kPosEps;
+    if (refreshed) {
+        g_camsrc_obj = cam;
+        g_camsrc_base[0] = cur[0]; g_camsrc_base[1] = cur[1]; g_camsrc_base[2] = cur[2];
+    }
+
+    const float o12 = (float)(g_camsrc_base[0] + wx);
+    const float o13 = (float)(g_camsrc_base[1] + wy);
+    const float o14 = (float)(g_camsrc_base[2] + wz);
+    if (!SafeCopyOut(cam + kCameraMatrixOffset + 0x30, &o12, sizeof(o12))) return false;
+    SafeCopyOut(cam + kCameraMatrixOffset + 0x34, &o13, sizeof(o13));
+    SafeCopyOut(cam + kCameraMatrixOffset + 0x38, &o14, sizeof(o14));
+    g_camsrc_written[0] = (double)o12; g_camsrc_written[1] = (double)o13; g_camsrc_written[2] = (double)o14;
+    {   // ~1/s
+        static uint64_t s_last = 0;
+        const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5CAMSRC] cam=0x{:X} local=({:.3f},{:.3f},{:.3f}) worldDelta=({:.3f},{:.3f},{:.3f}) base=({:.1f},{:.1f},{:.1f}) out=({:.1f},{:.1f},{:.1f})",
+                         cam, lx, ly, lz, wx, wy, wz,
+                         g_camsrc_base[0], g_camsrc_base[1], g_camsrc_base[2], o12, o13, o14);
+        }
+    }
+    return true;
+}
+
+// Anti-accumulation cache for the +0x90 Euler-angle injection (rot=angle / mode 3). The engine rewrites the
+// base orientation angles each frame; we detect that refresh by comparing the live angles to our last write,
+// so we compose head-look onto a CLEAN base (no spin on a parked camera, no double-apply if sub_1407A1AC0
+// fires more than once per frame for the same camera between engine refreshes).
+static uintptr_t g_angrot_obj = 0;
+static float     g_angrot_base[3]    = { 0.0f, 0.0f, 0.0f };
+static float     g_angrot_written[3] = { 0.0f, 0.0f, 0.0f };
+
+bool apply_angle_head_rotation_prewrite(uintptr_t cam) {
+    if (cam < 0x10000ull) return false;
+    if (fh5cb::ctl_rotation_mode() != 3) return false;                       // rot=angle only
+    {   // proda15 (rotation only) or camsrc (rotation + cam+0x320-row3 translation)
+        const int pl = fh5cb::ctl_pos_lane();
+        if (pl != fh5cb::kPosLaneProducerA15 && pl != fh5cb::kPosLaneCamSrc) return false;
+    }
+
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return false;      // no fresh VR head pose -> engine owns the angles
+
+    // Head Euler from the published delta basis (rows = right/up/forward). Identity basis -> (0,0,0), so at
+    // head-center this re-writes the engine base unchanged (idempotent). RADIANS, used raw (the rendered
+    // camera's +0x90/94/98 are radians fed straight to the Rodrigues build in sub_1407A1AC0).
+    const Vec3 f = delta.forward, r = delta.right, u = delta.up;
+    float fy = f.y; if (fy > 1.0f) fy = 1.0f; if (fy < -1.0f) fy = -1.0f;
+    const float yaw   = std::atan2(f.x, f.z);   // around up    -> cam+0x90
+    const float pitch = std::asin(fy);          // around right -> cam+0x94
+    const float roll  = std::atan2(r.y, u.y);   // around fwd   -> cam+0x98
+    if (!std::isfinite(yaw) || !std::isfinite(pitch) || !std::isfinite(roll)) return false;
+
+    float c90 = 0.0f, c94 = 0.0f, c98 = 0.0f;
+    if (!SafeRead(cam + 0x90, c90) || !SafeRead(cam + 0x94, c94) || !SafeRead(cam + 0x98, c98)) return false;
+    if (!std::isfinite(c90) || !std::isfinite(c94) || !std::isfinite(c98)) return false;
+    if (std::fabs(c90) > 1000.0f || std::fabs(c94) > 1000.0f || std::fabs(c98) > 1000.0f) return false;  // not the radian-angle camera
+
+    // Refresh detection -> clean base (no accumulation across re-entries within a frame).
+    constexpr float kAngEps = 1e-4f;
+    const bool refreshed =
+        (g_angrot_obj != cam) ||
+        std::fabs(c90 - g_angrot_written[0]) > kAngEps ||
+        std::fabs(c94 - g_angrot_written[1]) > kAngEps ||
+        std::fabs(c98 - g_angrot_written[2]) > kAngEps;
+    if (refreshed) {
+        g_angrot_obj = cam;
+        g_angrot_base[0] = c90; g_angrot_base[1] = c94; g_angrot_base[2] = c98;
+    }   // else: live angles still equal our last write -> engine did not refresh -> reuse g_angrot_base
+
+    const float o90 = g_angrot_base[0] + yaw;
+    const float o94 = g_angrot_base[1] + pitch;
+    const float o98 = g_angrot_base[2] + roll;
+    if (!SafeCopyOut(cam + 0x90, &o90, sizeof(o90))) return false;
+    SafeCopyOut(cam + 0x94, &o94, sizeof(o94));
+    SafeCopyOut(cam + 0x98, &o98, sizeof(o98));
+    g_angrot_written[0] = o90; g_angrot_written[1] = o94; g_angrot_written[2] = o98;
+    {   // ~1/s: confirm the rendered-camera angles are being head-rotated upstream of the +0x320 build.
+        static uint64_t s_last = 0;
+        const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5ANGLE] cam=0x{:X} base(90,94,98)=({:.4f},{:.4f},{:.4f}) head(yaw,pit,rol)=({:.4f},{:.4f},{:.4f}) out=({:.4f},{:.4f},{:.4f})",
+                         cam, g_angrot_base[0], g_angrot_base[1], g_angrot_base[2], yaw, pitch, roll, o90, o94, o98);
+        }
+    }
+    return true;
 }
 
 void on_input540_fold(uintptr_t object) {

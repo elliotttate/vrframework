@@ -51,7 +51,7 @@ unsigned long long cbv6912_count();
 float ctl_half_ipd();
 float ctl_world_scale();
 int   ctl_recenter_seq();
-int   ctl_rotation_mode();        // 0=off, 1=producer a4, 2=CCamDriver +0x320
+int   ctl_rotation_mode();        // 0=off, 1=producer a4, 2=CCamDriver +0x320 matrix, 3=camera +0x90 Euler angles (upstream of view+cull+shadow)
 bool  ctl_projection_enabled();   // true = replace producer a7 with per-eye OpenXR projection
 
 enum PosLane : int {
@@ -64,7 +64,8 @@ enum PosLane : int {
     kPosLaneOff = 6,
     kPosLaneViewTail = 7,      // active +0x320 plus first clone with a valid view-tail
     kPosLaneInput540 = 8,      // CCamDriver +0x540 additive camera-space input lane
-    kPosLaneProducerA15 = 9,   // producer sub_140BB1EE0 a15/a16 f64 world cameraPos (Empress RE: the true lever)
+    kPosLaneProducerA15 = 9,   // producer sub_140BB1EE0 a15/a16 f64 world cameraPos (moves view+cull; shadows slide)
+    kPosLaneCamSrc = 10,       // SHADOW-COHERENT: proda15 producer shift PLUS cam+0x320 row3 shift in the sub_1407A1AC0 hook (the matrix the cascade fit reads live)
 };
 int ctl_pos_lane();
 const char* pos_lane_name(int lane);
