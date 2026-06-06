@@ -46,6 +46,10 @@ std::atomic<bool>  g_ctl_projection{ true };
 std::atomic<int>   g_ctl_pos_lane{ kPosLaneProducerA15 };   // Empress RE: producer a15/a16 f64 cameraPos is the lever (+0x540 proved inert live)
 std::atomic<bool>  g_ctl_started{ false };
 std::atomic<int>   g_ctl_recenter_seq{ 0 };
+// --- runtime camera-orientation probe (find/rotate the view-source orientation that shadow cascades read) ---
+std::atomic<int>   g_ctl_pokerot{ -1 };     // rotate the orthonormal 4x4 at active_cam + offset by head delta (-1=off)
+std::atomic<int>   g_ctl_pokerotvs{ -1 };   // rotate the orthonormal 4x4 at (*(active_cam+0x48)) + offset (-1=off)
+std::atomic<bool>  g_ctl_dumpcam{ false };  // scan active_cam + view-source for orthonormal matrices; log offsets + basisScore
 
 // UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
 // argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
@@ -110,6 +114,12 @@ void poll_control_file() {
             else if (strncmp(line + 4, "driver", 6) == 0) iv = 5;   // CCamDriver+0x320 (upstream pose)
             else                                          iv = 4;   // all
             g_ctl_tgt.store(iv, std::memory_order_relaxed);
+        }
+        else {
+            unsigned uv = 0;
+            if      (sscanf_s(line, "pokerotvs=%x", &uv) == 1) g_ctl_pokerotvs.store((int)uv, std::memory_order_relaxed);
+            else if (sscanf_s(line, "pokerot=%x", &uv) == 1)   g_ctl_pokerot.store((int)uv, std::memory_order_relaxed);
+            else if (sscanf_s(line, "dumpcam=%u", &uv) == 1)   g_ctl_dumpcam.store(uv != 0, std::memory_order_relaxed);
         }
     }
     fclose(f);
@@ -440,6 +450,9 @@ int   ctl_recenter_seq(){ return g_ctl_recenter_seq.load(std::memory_order_relax
 int   ctl_rotation_mode(){ return g_ctl_rot_mode.load(std::memory_order_relaxed); }
 bool  ctl_projection_enabled(){ return g_ctl_projection.load(std::memory_order_relaxed); }
 int   ctl_pos_lane()    { return g_ctl_pos_lane.load(std::memory_order_relaxed); }
+int   ctl_pokerot()     { return g_ctl_pokerot.load(std::memory_order_relaxed); }
+int   ctl_pokerotvs()   { return g_ctl_pokerotvs.load(std::memory_order_relaxed); }
+bool  ctl_dumpcam()     { return g_ctl_dumpcam.load(std::memory_order_relaxed); }
 const char* pos_lane_name(int lane) {
     switch (lane) {
     case kPosLaneCcam320: return "ccam320";

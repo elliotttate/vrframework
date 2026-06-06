@@ -68,6 +68,9 @@ enum PosLane : int {
 };
 int ctl_pos_lane();
 const char* pos_lane_name(int lane);
+int ctl_pokerot();      // runtime probe: active_cam offset to basis-rotate (-1=off)
+int ctl_pokerotvs();    // runtime probe: view-source(*(cam+0x48)) offset to basis-rotate (-1=off)
+bool ctl_dumpcam();     // runtime probe: dump orthonormal-matrix offsets on cam + view-source
 
 // UPSTREAM camera-translation test (constant camera-relative offset applied in the producer hook to find
 // which argument is the real camera-position lever, with shadows/derived data following). tgt: 0=off,

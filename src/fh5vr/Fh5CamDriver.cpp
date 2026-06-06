@@ -2374,6 +2374,16 @@ DWORD WINAPI WorkerThread(void*) {
             continue;
         }
 
+        // Runtime orientation probe from the WORKER (fires reliably even when the camera-update fold is quiet,
+        // e.g. parked): dumpcam scans this camera + its view-source for the orthonormal orientation matrix;
+        // pokerot/pokerotvs live-rotate a chosen offset. The fold-hook path is preferred for the final fix
+        // (synchronous, fires per-frame while driving), but the worker is what lets us FIND the source now.
+        probe_camera(object_to_use);
+        // NOTE: head-look rotation is now applied at the camera pose getter sub_1407A9DD0 (Hook_AimGetter ->
+        // rotate_aim_lookdir on +0x540), NOT here. +0x320 is a per-frame-rebuilt copy (the getter rebuilds it
+        // from the look-at +0x540 lane), so rotating +0x320 from the worker was clobbered. The look-direction
+        // lane is the real upstream source the producer a4 and the shadow cascades both derive from.
+
         const float class_priority = layout.class_priority;
         if (!writer_active) {
             const uint64_t now_ms = NowMs();
@@ -2648,6 +2658,199 @@ bool current_local_offset(float& strafe, float& up, float& fwd) {
     }
     constexpr float kEps = 1e-4f;
     return active && (std::fabs(strafe) > kEps || std::fabs(up) > kEps || std::fabs(fwd) > kEps);
+}
+
+// Anti-accumulation cache for the +0x320 rotation. The engine re-derives +0x320 from the car each frame;
+// we detect that refresh by comparing to our last write, so we compose head rotation onto a CLEAN base
+// rather than onto an already-rotated matrix (which would spin a parked camera).
+static uintptr_t g_camrot_obj = 0;
+static Matrix4 g_camrot_base{};
+static Matrix4 g_camrot_written{};
+
+static bool MatricesClose16(const Matrix4& a, const Matrix4& b, float eps) {
+    for (size_t i = 0; i < a.m.size(); ++i) {
+        if (std::fabs(a.m[i] - b.m[i]) > eps) return false;
+    }
+    return true;
+}
+
+// Row-vector compose r = d * m (same convention as the proven producer a4 rotation Mul(delta, a4)).
+static Matrix4 MulRowVector(const Matrix4& d, const Matrix4& m) {
+    Matrix4 r{};
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; ++k) s += d.m[i * 4 + k] * m.m[k * 4 + j];
+            r.m[i * 4 + j] = s;
+        }
+    }
+    return r;
+}
+
+bool apply_camdriver_head_rotation(uintptr_t object) {
+    if (object < 0x10000ull) return false;
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return false;
+
+    // Head rotation (row-vector 3x3, rows = right/up/forward) published by apply_stereo via the driver
+    // delta; identity at rest. If VR is not engaged, leave the engine pose untouched.
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return false;
+
+    // Gate: a known camera object with an orthonormal +0x320 basis (the publisher can fire for more than
+    // the active camera). DecodePose enforces orthonormal basis + cam-to-world layout.
+    uintptr_t vtable = 0;
+    if (!SafeRead(object, vtable)) return false;
+    vtable = EffectiveObjectVtable(object, vtable);
+    if (!IsKnownCameraVtable(vtable)) return false;
+
+    Matrix4 cur{};
+    if (!SafeCopyIn(object + kCameraMatrixOffset, cur.m.data(), sizeof(float) * cur.m.size())) return false;
+    Pose decoded{};
+    if (!DecodePose(cur, decoded)) return false;
+
+    // Refresh detection -> clean base (no accumulation).
+    if (g_camrot_obj != object) {
+        g_camrot_obj = object;
+        g_camrot_base = cur;
+    } else if (!MatricesClose16(cur, g_camrot_written, 1e-3f)) {
+        g_camrot_base = cur;   // engine wrote a fresh pose this frame
+    }   // else: engine did not refresh -> reuse g_camrot_base
+
+    Matrix4 rot{};
+    rot.m[0]  = delta.right.x;   rot.m[1]  = delta.right.y;   rot.m[2]  = delta.right.z;   rot.m[3]  = 0.0f;
+    rot.m[4]  = delta.up.x;      rot.m[5]  = delta.up.y;      rot.m[6]  = delta.up.z;      rot.m[7]  = 0.0f;
+    rot.m[8]  = delta.forward.x; rot.m[9]  = delta.forward.y; rot.m[10] = delta.forward.z; rot.m[11] = 0.0f;
+    rot.m[12] = 0.0f;            rot.m[13] = 0.0f;            rot.m[14] = 0.0f;            rot.m[15] = 1.0f;
+
+    // Compose head rotation in front of the camera-to-world basis (keeps the position row 3), then commit
+    // BEFORE the publisher copies the pose downstream so the shadow cascades fit to the rotated frustum.
+    const Matrix4 out = MulRowVector(rot, g_camrot_base);
+    if (!SafeCopyOut(object + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) return false;
+    g_camrot_written = out;
+    return true;
+}
+
+// Runtime camera-orientation probe. Called post-fold on the active CCamDriver. Two jobs:
+//  (1) dumpcam: scan the CCamDriver AND its nested view-source object (*(this+0x48)) for orthonormal 4x4s,
+//      logging each offset + its basisScore vs the live producer a4. The offset whose basisScore≈3 is the
+//      camera orientation the producer (and the shadow-cascade fit) consume — the lever we must rotate.
+//  (2) pokerot/pokerotvs: rotate the orthonormal 4x4 at a control-file-chosen offset (on the cam, or on the
+//      view-source) by the published head delta — so we can sweep candidate orientation sources LIVE and
+//      watch whether the view + shadows follow, without rebuilding.
+void probe_camera(uintptr_t object) {
+    if (object < 0x10000ull) return;
+
+    if (fh5cb::ctl_dumpcam()) {
+        static uint64_t s_last_dump_ms = 0;
+        const uint64_t now = NowMs();
+        if (now - s_last_dump_ms >= 1000) {
+            s_last_dump_ms = now;
+            Pose hint{};
+            const bool have_hint = SnapshotPoseHint(hint);
+            uintptr_t vs = 0;
+            SafeRead(object + 0x48, vs);
+            spdlog::info("[FH5DUMP] object=0x{:X} vs=0x{:X} a4hint_ok={} a4.fwd=({:.3f},{:.3f},{:.3f})",
+                         object, vs, have_hint ? 1 : 0, hint.forward.x, hint.forward.y, hint.forward.z);
+            const auto scan = [&](uintptr_t base, const char* tag) {
+                if (base < 0x10000ull) return;
+                for (uintptr_t off = 0; off <= 0x640; off += 4) {
+                    Matrix4 m{};
+                    if (!SafeCopyIn(base + off, m.m.data(), sizeof(float) * m.m.size())) break;
+                    Pose p{};
+                    if (!DecodePose(m, p)) continue;
+                    const float bs = have_hint ? BasisScore(p, hint) : 0.0f;
+                    spdlog::info("[FH5DUMP]   {} +0x{:X} basisScore={:.3f} fwd=({:.3f},{:.3f},{:.3f}) pos=({:.2f},{:.2f},{:.2f})",
+                                 tag, off, bs, p.forward.x, p.forward.y, p.forward.z,
+                                 p.position.x, p.position.y, p.position.z);
+                }
+            };
+            scan(object, "cam");
+            scan(vs, "vs ");
+        }
+    }
+
+    const int pr = fh5cb::ctl_pokerot();
+    const int prvs = fh5cb::ctl_pokerotvs();
+    if (pr < 0 && prvs < 0) return;
+
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return;
+
+    Matrix4 rot{};
+    rot.m[0]  = delta.right.x;   rot.m[1]  = delta.right.y;   rot.m[2]  = delta.right.z;   rot.m[3]  = 0.0f;
+    rot.m[4]  = delta.up.x;      rot.m[5]  = delta.up.y;      rot.m[6]  = delta.up.z;      rot.m[7]  = 0.0f;
+    rot.m[8]  = delta.forward.x; rot.m[9]  = delta.forward.y; rot.m[10] = delta.forward.z; rot.m[11] = 0.0f;
+    rot.m[12] = 0.0f;            rot.m[13] = 0.0f;            rot.m[14] = 0.0f;            rot.m[15] = 1.0f;
+
+    const auto pokerot = [&](uintptr_t base, int off) {
+        if (base < 0x10000ull || off < 0) return;
+        Matrix4 m{};
+        if (!SafeCopyIn(base + static_cast<uintptr_t>(off), m.m.data(), sizeof(float) * m.m.size())) return;
+        Pose p{};
+        if (!DecodePose(m, p)) return;   // only rotate a genuine orthonormal basis
+        const Matrix4 out = MulRowVector(rot, m);
+        SafeCopyOut(base + static_cast<uintptr_t>(off), out.m.data(), sizeof(float) * out.m.size());
+    };
+    if (pr >= 0) pokerot(object, pr);
+    if (prvs >= 0) {
+        uintptr_t vs = 0;
+        if (SafeRead(object + 0x48, vs)) pokerot(vs, prvs);
+    }
+}
+
+// Anti-accumulation cache for the +0x540 look-direction lane (the LOOK-AT camera's orientation input).
+static uintptr_t g_aim_obj = 0;
+static Vec4 g_aim_base{};
+static Vec4 g_aim_written{};
+
+// SHADOW-COHERENT head-look. FH5's gameplay camera is a LOOK-AT camera: orientation is derived each frame
+// from the look-direction lane at CCamDriver+0x540 (aim = +0x530 eye + +0x540 lookdir; forward ∝ +0x540).
+// The getter sub_1407A9DD0 rebuilds the basis from it EVERY frame (fires parked too, unlike the fold), and
+// the shadow cascades derive from that same basis — so ROTATING the look direction here (before the getter
+// reads it) makes the main view AND cascades follow head-look. Rotate the +0x540 vector by the head delta
+// (anti-accumulation so a static look dir doesn't spin). Translating +0x540 was inert; rotating it steers.
+bool rotate_aim_lookdir(uintptr_t object) {
+    if (object < 0x10000ull) return false;
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return false;
+
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return false;
+
+    Vec4 cur{};
+    if (!SafeCopyIn(object + kInputOffsetLane, &cur, sizeof(cur))) return false;
+    if (!std::isfinite(cur.x) || !std::isfinite(cur.y) || !std::isfinite(cur.z)) return false;
+
+    Vec4 base{};
+    if (g_aim_obj != object) {
+        g_aim_obj = object;
+        base = cur;
+        g_aim_base = cur;
+    } else if (std::fabs(cur.x - g_aim_written.x) < 1e-3f &&
+               std::fabs(cur.y - g_aim_written.y) < 1e-3f &&
+               std::fabs(cur.z - g_aim_written.z) < 1e-3f) {
+        base = g_aim_base;   // engine didn't refresh the look dir -> reuse the clean base (no spin)
+    } else {
+        base = cur;
+        g_aim_base = cur;    // engine wrote a fresh look dir this frame
+    }
+
+    // Rotate the look-direction vector by the head delta R (row-vector 3x3; rows = right/up/forward).
+    // new = R * base. Convention verified live; flip R if the yaw sense is reversed.
+    const Vec4 out{
+        delta.right.x   * base.x + delta.right.y   * base.y + delta.right.z   * base.z,
+        delta.up.x      * base.x + delta.up.y      * base.y + delta.up.z      * base.z,
+        delta.forward.x * base.x + delta.forward.y * base.y + delta.forward.z * base.z,
+        cur.w
+    };
+    if (!SafeCopyOut(object + kInputOffsetLane, &out, sizeof(out))) return false;
+    g_aim_written = out;
+    return true;
 }
 
 void on_input540_fold(uintptr_t object) {

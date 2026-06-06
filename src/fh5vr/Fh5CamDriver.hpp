@@ -56,6 +56,23 @@ void on_input540_fold(uintptr_t object);
 // hook (poslane=proda15). Returns false when there is no active, finite, non-trivial offset.
 bool current_local_offset(float& strafe, float& up, float& fwd);
 
+// Called by the CCamDriver +0x320 publisher hook (sub_1406BE3A0) with the live camera object. When
+// poslane=proda15 and a head rotation is published, rotates the object's +0x320 camera-to-world BASIS in
+// place (compose-on-top, anti-accumulation) BEFORE the publisher copies it downstream — so the main view
+// AND the shadow cascades (which read +0x320, not the producer a4) follow head-look. Gated to a known
+// camera vtable with an orthonormal-basis sanity check. Returns true if it wrote the pose.
+bool apply_camdriver_head_rotation(uintptr_t object);
+
+// Runtime camera-orientation probe (dumpcam / pokerot / pokerotvs control-file knobs). Called post-fold on
+// the active CCamDriver to locate + live-rotate the orientation source the shadow cascades consume.
+void probe_camera(uintptr_t object);
+
+// SHADOW-COHERENT head-look. Called at the ENTRY of the camera pose getter sub_1407A9DD0 (which rebuilds the
+// look-at basis from CCamDriver+0x540 every frame, feeding both the producer a4 and the shadow-cascade fit).
+// Rotates the +0x540 look-direction by the published head delta so the whole frustum (view + cascades) turns
+// with the head. Gated to poslane=proda15; anti-accumulated. Returns true if it wrote the lane.
+bool rotate_aim_lookdir(uintptr_t object);
+
 // Called by the producer hook with pointer-looking arguments. If an argument is already the active camera
 // object, a shared-pointer control block, a ForzaMultiCam object, or a wrapper containing one, this captures
 // the concrete camera object without process-wide scanning.

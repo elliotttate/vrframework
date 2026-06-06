@@ -37,7 +37,9 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Shared stereo state: written by apply_stereo (VR/core thread), read by the
@@ -138,6 +140,56 @@ static std::atomic<float> g_lastNear{ 0.0f }, g_lastFar{ 0.0f };
 // while ANY far>30000 frame is recent (intro running); world3d only once the far>30000 camera fully stops.
 static std::atomic<uint64_t> g_lastShowcaseMs{ 0 }, g_lastWorldMs{ 0 };
 
+bool producer_stack_probe_enabled() {
+    static const bool enabled = [] {
+        char value[16]{};
+        const DWORD n = ::GetEnvironmentVariableA("FH5_PRODUCER_STACK_PROBE", value, sizeof(value));
+        return n > 0 && value[0] != '0' && value[0] != 'f' && value[0] != 'F';
+    }();
+    return enabled;
+}
+
+void maybe_log_producer_stack(uint64_t main_hits, float near_plane, float far_plane) {
+    if (!producer_stack_probe_enabled()) return;
+
+    static std::atomic<uint32_t> s_emitted{ 0 };
+    static std::atomic<uint64_t> s_last_ms{ 0 };
+
+    const uint32_t emitted = s_emitted.load(std::memory_order_relaxed);
+    if (emitted >= 24) return;
+
+    const uint64_t now = ::GetTickCount64();
+    uint64_t last = s_last_ms.load(std::memory_order_relaxed);
+    if (now - last < 1000) return;
+    if (!s_last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+
+    const uint32_t index = s_emitted.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 24) return;
+
+    void* frames[32]{};
+    const USHORT count = ::CaptureStackBackTrace(
+        0, static_cast<DWORD>(sizeof(frames) / sizeof(frames[0])), frames, nullptr);
+    const uintptr_t base = memory::module_base();
+    const uintptr_t end = base + memory::module_size();
+
+    std::string trace;
+    trace.reserve(512);
+    for (USHORT i = 0; i < count; ++i) {
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(frames[i]);
+        char part[64]{};
+        if (base != 0 && addr >= base && addr < end) {
+            std::snprintf(part, sizeof(part), "%s+0x%llX", trace.empty() ? "" : " ",
+                static_cast<unsigned long long>(addr - base));
+        } else {
+            std::snprintf(part, sizeof(part), "%s%p", trace.empty() ? "" : " ", frames[i]);
+        }
+        trace += part;
+    }
+
+    spdlog::info("[FH5] producer stack probe #{} mainHits={} near={:.4f} far={:.1f} frames={}",
+        index + 1, main_hits, near_plane, far_plane, trace);
+}
+
 static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, double a5, void* a6,
     void* a7, float a8, float a9, void* a10, int a11, unsigned a12, __int64 a13, void* a14, double a15,
     __int64 a16, void* a17, void* a18, float a19, void* a20, void* a21, unsigned a22, unsigned a23,
@@ -216,6 +268,7 @@ static void __fastcall Hook_Producer(void* a1, __int64 a2, int a3, void* a4, dou
         // camera-driver hook evidence we need during bring-up.
         static int s_last_logged_eye = -1;
         static uint64_t s_last_prod_log_ms = 0;
+        maybe_log_producer_stack(hits, a8, a9);
         StereoState dbg{}; const bool act = snapshot_stereo(dbg);
         const uint64_t now_ms = ::GetTickCount64();
         if (dbg.eye_idx != s_last_logged_eye && now_ms - s_last_prod_log_ms >= 1000) {
@@ -376,6 +429,12 @@ static __int64 __fastcall Hook_CamDriver(__int64 a1, __int64 a2) {
     g_camdriverCalls.fetch_add(1, std::memory_order_relaxed);
     if (a1 != 0) {
         fh5cam::publish_driver(static_cast<uintptr_t>(a1));
+        // SHADOW-COHERENT head rotation: rotate the UPSTREAM CCamDriver +0x320 camera-to-world basis BEFORE
+        // this publisher copies the pose downstream. The shadow-cascade fitter reads this same +0x320 pose
+        // (NOT the producer's a4 — see fh5_empress_shadow_cascade_RE.md), so rotating it here makes the main
+        // view AND the cascades/culling follow head-look. Gated to poslane=proda15; the producer a4 rotation
+        // is left at identity in that mode (apply_stereo). Translation stays on the producer a15/a16 f64 lever.
+        fh5cam::apply_camdriver_head_rotation(static_cast<uintptr_t>(a1));
     }
     return original(a1, a2);
 }
@@ -412,6 +471,9 @@ static void __fastcall Hook_Input540Fold(__int64 self) {
     }
     auto original = g_input540_fold_hook->get_original<Input540FoldFn>();
     original(self);
+    // NOTE: the camera-orientation probe (dumpcam/pokerot) is driven from the Fh5CamDriver WORKER, not here,
+    // because this fold only fires while the camera is actively updating (quiet when parked). The worker
+    // resolves the active camera every loop, so it can scan/rotate even in the parked showcase test scene.
 }
 
 // SEH-guarded byte compare (no C++ object unwinding here, so __try is legal — install_hooks holds
@@ -431,6 +493,20 @@ static bool BytesMatchSEH(uintptr_t addr, const unsigned char* expected, size_t 
     }
 }
 
+// Camera pose getter sub_1407A9DD0 (Empress RVA 0x7A9DD0): rebuilds the look-at basis from CCamDriver+0x540
+// every frame (feeds the producer a4 AND the shadow-cascade fit). We rotate the +0x540 look-direction on
+// ENTRY (before it is consumed) so head-look turns the whole frustum — shadow-coherent. a1(rcx)=CCamDriver.
+using AimGetterFn = char(__fastcall*)(void*, __int64, unsigned char);
+static std::unique_ptr<FunctionHook> g_aim_getter_hook;
+
+static char __fastcall Hook_AimGetter(void* a1, __int64 a2, unsigned char a3) {
+    if (a1 != nullptr) {
+        fh5cam::rotate_aim_lookdir(reinterpret_cast<uintptr_t>(a1));
+    }
+    auto original = g_aim_getter_hook->get_original<AimGetterFn>();
+    return original(a1, a2, a3);
+}
+
 bool Fh5Adapter::install_hooks() {
     // sub_140BB1EE0 prologue (Empress RVA 0xBB1EE0). Scan-or-fallback so a single binary serves the build.
     const uintptr_t addr = memory::FuncRelocation(
@@ -445,18 +521,21 @@ bool Fh5Adapter::install_hooks() {
     g_producer_hook = std::make_unique<FunctionHook>(Address{ addr }, &Hook_Producer);
     const bool ok = g_producer_hook->create();
 
-    // CCamDriver pose publisher. Do not use an RVA fallback here: the known 0x6BE3A0 address belongs to a
-    // different build than the live Empress 1.405 test exe, and a stale hook target is worse than no hook.
-    const uintptr_t cd = memory::FuncRelocation(
-        "fh5_ccamdriver_publish",
-        "40 53 48 83 EC 20 48 81 C1 20 03 00 00 48 8B DA E8",
-        /*fallback RVA*/ 0);
-    if (cd != 0) {
+    // CCamDriver +0x320 publisher sub_1406BE3A0 (Empress RVA 0x6BE3A0; confirmed live in the .i64 by
+    // fh5_empress_shadow_cascade_RE.md). The Release build's signature scan misses this .text region (the
+    // producer only installed via its fallback RVA), so resolve by RVA + a prologue sanity-check. Defining
+    // insn: `add rcx,0x320; mov rbx,rdx`. Hooking it lets us rotate the upstream pose so the shadow cascades
+    // (which read +0x320, not a4) follow head-look.
+    const uintptr_t cd = memory::module_base() + 0x6BE3A0;
+    static const unsigned char kCamDriverPrologue[] = {
+        0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x81,0xC1,0x20,0x03,0x00,0x00, 0x48,0x8B,0xDA
+    };
+    if (BytesMatchSEH(cd, kCamDriverPrologue, sizeof(kCamDriverPrologue))) {
         g_camdriver_hook = std::make_unique<FunctionHook>(Address{ cd }, &Hook_CamDriver);
         if (!g_camdriver_hook->create()) { g_camdriver_hook.reset(); spdlog::warn("[FH5] CCamDriver hook create failed"); }
-        else spdlog::info("[FH5] CCamDriver pose hook installed @0x{:X}", cd);
+        else spdlog::info("[FH5] CCamDriver +0x320 publisher hook installed @0x{:X} (prologue verified)", cd);
     } else {
-        spdlog::warn("[FH5] CCamDriver AOB not found");
+        spdlog::warn("[FH5] CCamDriver +0x320 publisher prologue MISMATCH at 0x{:X}; not hooking (build/base drift?)", cd);
     }
 
     // ForzaMultiCam state bridge. Do not use an RVA fallback here either; the bridge AOB is absent from the
@@ -495,6 +574,26 @@ bool Fh5Adapter::install_hooks() {
     } else {
         spdlog::warn("[FH5] CCamDriver +0x540 input-fold prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)",
                      input540);
+    }
+
+    // Camera pose getter sub_1407A9DD0 (RVA 0x7A9DD0) — the per-frame look-at basis rebuild. Hooking its
+    // entry lets us rotate the +0x540 look-direction so the main view AND shadow cascades follow head-look.
+    // Raw-RVA target -> verify the prologue before inline-hooking (no ASLR; base 0x140000000).
+    const uintptr_t aim = memory::module_base() + 0x7A9DD0;
+    static const unsigned char kAimGetterPrologue[] = {
+        0x48,0x8B,0xC4, 0x48,0x89,0x58,0x18, 0x48,0x89,0x70,0x20, 0x55,
+        0x48,0x8D,0x68,0xA1, 0x48,0x81,0xEC,0xB0,0x00,0x00,0x00
+    };
+    if (BytesMatchSEH(aim, kAimGetterPrologue, sizeof(kAimGetterPrologue))) {
+        g_aim_getter_hook = std::make_unique<FunctionHook>(Address{ aim }, &Hook_AimGetter);
+        if (!g_aim_getter_hook->create()) {
+            g_aim_getter_hook.reset();
+            spdlog::warn("[FH5] camera pose getter hook create failed");
+        } else {
+            spdlog::info("[FH5] camera pose getter hook installed @0x{:X} (prologue verified)", aim);
+        }
+    } else {
+        spdlog::warn("[FH5] camera pose getter prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)", aim);
     }
 
     return ok;
@@ -601,9 +700,11 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     const int pos_lane = fh5cb::ctl_pos_lane();
     // The +0x540 lane is a translation input only. Keep rot=driver as the public default, but route
     // rotation through the known-live producer hook while +0x540 owns upstream translation.
+    // input540 has no upstream rotation hook -> keep its rotation on the producer a4 (rot_mode 1).
+    // proda15 routes rotation to the CCamDriver +0x320 publisher hook (rot_mode 2 -> driver delta published),
+    // so the producer a4 stays identity and the shadow cascades (reading +0x320) follow head-look.
     const int rot_mode =
-        ((pos_lane == fh5cb::kPosLaneInput540 || pos_lane == fh5cb::kPosLaneProducerA15) &&
-         requested_rot_mode == 2) ? 1 : requested_rot_mode;
+        (pos_lane == fh5cb::kPosLaneInput540 && requested_rot_mode == 2) ? 1 : requested_rot_mode;
     const bool upstream_position =
         pos_lane != fh5cb::kPosLaneDownstream &&
         pos_lane != fh5cb::kPosLaneOff;
