@@ -2728,6 +2728,20 @@ bool apply_camdriver_head_rotation(uintptr_t object) {
     const Matrix4 out = MulRowVector(rot, g_camrot_base);
     if (!SafeCopyOut(object + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) return false;
     g_camrot_written = out;
+    {   // ~1/s diagnostic: confirms the getter fires + +0x320 is being rotated (calls climb while driving).
+        static uint64_t s_last = 0;
+        static uint64_t s_calls = 0;
+        ++s_calls;
+        const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            const float rotmag = std::fabs(rot.m[0] - 1.0f) + std::fabs(rot.m[5] - 1.0f) + std::fabs(rot.m[10] - 1.0f);
+            spdlog::info("[FH5CAMROT] obj=0x{:X} calls={} rotMag={:.3f} baseFwd=({:.3f},{:.3f},{:.3f}) outFwd=({:.3f},{:.3f},{:.3f})",
+                         object, s_calls, rotmag,
+                         g_camrot_base.m[8], g_camrot_base.m[9], g_camrot_base.m[10],
+                         out.m[8], out.m[9], out.m[10]);
+        }
+    }
     return true;
 }
 
