@@ -2,10 +2,37 @@
 
 DB: `E:\tmp\fh5_re\fh5_b.i64`, base `0x140000000`, no anti-tamper. RTTI is **fully present**
 (114,102 type descriptors; CCamDriver vtable `0x145E3F290` resolves to `.?AVCCamDriver@Camera@@`).
-All scripts: `…\FH5CameraProbe\scripts\ida_viewsource_orient_*.py`. Raw outputs:
-`E:\tmp\fh5_re\vs_phase{A..M}.out`.
+All scripts: `…\FH5CameraProbe\scripts\ida_viewsource_orient_*.py` and `ida_*builder*/find_S/off600/world600/final_recipe.py`.
+Raw outputs: `E:\tmp\fh5_re\vs_phase{A..M}.out`, `cmulticam.out`, `off600.out`, `world600.out`, `find_S.out`.
 
 RVA→EA = rva + 0x140000000.
+
+---
+
+## ⚠ CORRECTION (round 2 — after live test): the builder DISCARDS +0x540
+
+The live test (rotating `+0x540` gave only a tiny wrong-axis nudge) is explained by the
+disassembly of the builder. **`S->vtable[0x68]` ignores its input vector.** For every concrete
+view-source class it just returns a *stored* basis row:
+
+| view-source class | vtable | slot 0x68 builder | body |
+|---|---|---|---|
+| `CMultiCam@Camera@@` | `0x145E1E558` | `sub_1405FA880` | `*out = *(S+0x600)` |
+| `CCamFree@Camera@@`  | `0x145E40D78` | `sub_1407A3A00` | `*out = *(S+0x5E0)` |
+| `CCamDriver`/`CCamFollow`/`CCamCockpit`/`CCamHood` | `0x145E3F290` … | `sub_1405391C0` | `*out = const [0,0,1,0]` |
+
+`sub_1405FA880` raw (`0x1405FA880`):
+```asm
+movups xmm0, [rcx+600h]   ; read S+0x600
+movups [rdx], xmm0        ; -> out  (input vector in r8 is never touched)
+retn
+```
+So the `(*(+0x540)+*(+0x530))` vector passed by the getter/fold is dead for orientation. The
+camera's **world basis is a stored 4×4 on the view-source S**, recomputed each frame from the
+car/target transform — NOT a look-at over `+0x540`. See "Round-2 findings" below for the real
+matrix and the corrected recipe. The Q1–Q5 sections below remain accurate about the *plumbing*
+(object chain, a4 assembly, cascade coherence); only the "+0x540 is the orientation" claim in the
+original TL;DR is superseded.
 
 ---
 
@@ -263,3 +290,122 @@ Constants: `xmmword_145E03270 = [1,0,0,0]`, `xmmword_145E03280 = [0,0,1,0]`.
 * `+0x570` — **blend/up row 3** (`vtbl[0x338]` → `sub_1407A34D0`).
 * `+0x320` — orthonormal cam-to-world per-frame **snapshot** (sibling consumer, not a source).
 * `+0x630/+0x638` — extra dir lane used by the `sub_1407AC2D0` a4 path.
+
+---
+
+# ROUND-2 FINDINGS — the real world basis + corrected recipe
+
+## What the getter/fold actually do (raw disasm, ground truth)
+
+Getter `sub_1407A9DD0` (`0x1407A9DD0`) and fold `sub_1407A6300` (`0x1407A6300`) both:
+1. `S = *(CCamDriver+0x48)` — `mov rcx,[rbx+48h]`.
+2. `in = *(CCamDriver+0x540) + *(CCamDriver+0x530)` — `movups xmm0,[rbx+540h]; addps xmm0,[rbx+530h]`.
+3. `rows = S->vtable[0x68](S, &out, &in)` — `call [rax+68h]` → stored to `CCamDriver+0x550..+0x568`.
+4. `row3 = CCamDriver->vtable[0x338](CCamDriver)` → `CCamDriver+0x570`.
+
+But step 3's callee **discards `in`** (see correction box). It copies `*(S+0x600)`. So
+`CCamDriver+0x550` (= producer `a4` row0) is literally `*(S+0x600)`.
+
+Producer a4 assembler `sub_1407AC2D0` (`0x1407AC2D0`) is the same: `S=*(this+0x48)`,
+`row=S->vtable[0x68](...)` → `this+0x550`, then `S->vtable[0x70]` → `this+0x570`. The input it
+passes is `unpcklps(*(this+0x630),*(this+0x638))` — also discarded by the 0x68 callee.
+
+## The real WORLD camera basis lives on the view-source S
+
+`sub_14060B390` (`0x60B390`, RVA `0x60B390`) is the **CMultiCam per-frame world-basis producer**.
+It writes the full camera-to-world basis onto S:
+
+| offset on S | what | how (quoting sub_14060B390) |
+|---|---|---|
+| `S+0x650` (1616) | **basis row 0** | from `*(S+0x5C0)->vtable[+440]` / `sub_1407A2430(...)` (the v29 path), or `*(*(S+0x5C0)+800)` |
+| `S+0x660` (1632) | **basis row 1** | `*(*(S+0x5C0)+816)` / `v33[1]` |
+| `S+0x670` (1648) | **basis row 2** | `*(*(S+0x5C0)+832)` / `v33[2]` |
+| `S+0x680` (1664) | **basis row 3 (pos/scale)** | `*(*(S+0x5C0)+848)` / `v33[3]` |
+| `S+0x600` (1536) | **what slot-0x68 builder returns** (= row the getter writes to a4 row0 / `CCamDriver+0x550`) | written elsewhere from this basis (`sub_1407A6780`/`sub_1407AA830`) |
+| `S+0x620` (1568) | normalized quaternion-ish axis derived from the basis | SIMD block lines 313-353 |
+| `S+0x630` (1584) | normalized direction | line 398 |
+| `S+0x5C0` (1472) | **pointer to the UPSTREAM source object** (car/target transform provider) | its `vtable[+432]` = world transform getter, `vtable[+440]` = basis rows |
+
+So the orientation chain is:
+```
+*(S+0x5C0)  (car/target world transform; vtable[+432]=transform, [+440]=basis rows)
+   └─ sub_14060B390 builds the 4x4 WORLD basis on S → S+0x650..+0x680  (and S+0x600 row)
+        └─ S->vtable[0x68] returns S+0x600  → getter/fold/a4 → CCamDriver+0x550 (a4 row0)
+challenge: rotating CCamDriver+0x540 never enters this chain → no effect (matches live test)
+```
+
+`S` is a `CMultiCam@Camera@@` (vtable `0x145E1E558`) — confirmed via RTTI; its slot 0x68 =
+`sub_1405FA880`, slot 0x10 = `sub_140602220`, slot 0x70 = `sub_1407A4AA0` (projection row from
+FOV getters at `vtbl+0x1A8/+0x1A0/+0xA0`). The frame layout `[75,40,20,3][1.5,0.785,0.524,…]`
+in the CCamFree identity-init (`xmmword_1480721B0`…) shows these are FOV/dist/euler *config*
+rows, not the world matrix — the world matrix is the runtime `S+0x650` block.
+
+## Q1–Q3 answers (corrected)
+
+1. **World eye**: the f64 position is `CCamDriver+0x550`-region in the getter is actually the
+   *rows*, not the eye; the f64 world eye `(-5059,179,-271,1)` is the basis-row-3 translation in
+   `S+0x680` (and mirrored into the producer a4 pos row). The eye/aim float4s at
+   `CCamDriver+0x530/+0x540` are a *separate, unused-for-orientation* aim-offset lane.
+2. **Up vector / look-at?** There is no live `lookAt(eye,aim,up)` over `+0x540`. The basis is the
+   car/target world transform (`*(S+0x5C0)->vtable[+432/+440]`) optionally re-oriented by config.
+   The "up/right" are rows 0/1 of `S+0x650`.
+3. **Producer a4 basis** = the getter copies `S->vtable[0x68]()` (= `S+0x600`) into
+   `CCamDriver+0x550` and `S->vtable[0x70]()` into `+0x570`; the producer reads those as a4. The
+   cascades read the same a4 (Q5 unchanged). The world forward `(-0.965,0.017,0.261)` you read is
+   row(2) of `S+0x650` (= `S+0x600`'s sibling).
+
+## THE CORRECTED RECIPE
+
+The `+0x540` lane is a dead end. Inject on the **world basis** instead. Three options, best first:
+
+### (a) BEST — rotate the world basis rows on S (upstream of a4 AND cascades)
+Hook the getter `sub_1407A9DD0` entry (already working) but operate on `S = *(CCamDriver+0x48)`:
+```
+S        = *(uint8_t**)(CCamDriver + 0x48);     // the CMultiCam view-source
+float* M = (float*)(S + 0x650);                 // 4x4 world basis, ROW-MAJOR, row-vector convention
+// rows: M[0..3]=right, M[4..7]=up, M[8..11]=forward, M[12..15]=pos(world, f32 here)
+// Apply head rotation R (camera-local yaw/pitch/roll) by PRE-multiplying the 3x3:
+//   newBasis3x3 = R * basis3x3      (R expressed in the camera's own right/up/fwd frame)
+// i.e. rotate the (right,up,forward) vectors together. Also write the SAME rotated row0 to S+0x600
+*(float4*)(S+0x600) = newRow0;                  // keep the slot-0x68 source in sync
+```
+Because `sub_14060B390` REBUILDS `S+0x650` every frame from `*(S+0x5C0)`, you must apply the
+rotation AFTER that rebuild and BEFORE the getter copies it — i.e. hook the getter entry (which
+runs after the per-frame `sub_14060B390`) and rotate `S+0x650`/`S+0x600` there. Convention is
+**row-vector** (FH5 builds rows; `worldPos = localPos * M`), so compose head rotation as
+`M' = Rhead * M` with `Rhead` a row-vector rotation matrix in the camera frame. A 50° head yaw
+about the camera up (row1) then yields a 50° world yaw, and the cascades follow (they read a4 =
+copy of this basis).
+
+### (b) ALSO VALID — rotate the producer a4 rows directly (your existing working hook)
+The downstream producer-`a4` hook already proven in MEMORY rotates the main view. To make the
+**cascades** follow too, the rotation must be applied to a4 BEFORE the cascade fit inside the
+producer (`sub_140BB1EE0`), not after. Option (a) is cleaner because the getter runs upstream of
+the producer entirely.
+
+### (c) rotate the upstream source `*(S+0x5C0)` transform
+`*(S+0x5C0)` is the car/target whose `vtable[+432/+440]` feeds the basis. Rotating it would also
+rotate gameplay logic that reads the car transform — NOT recommended for head-look.
+
+### Frame/convention summary for option (a)
+- Object: `S = *(CCamDriver+0x48)` (CMultiCam, vtable `0x145E1E558`).
+- Matrix: `S+0x650` = 4×4 **row-major, row-vector** world basis (right@+0x650, up@+0x660,
+  fwd@+0x670, pos@+0x680). Mirror row0 to `S+0x600`.
+- Apply: `M3x3' = R_head * M3x3` (pre-multiply; R_head built in camera right/up/fwd basis).
+  Yaw = rotation about up(row1), pitch = about right(row0), roll = about fwd(row2).
+- When: getter `sub_1407A9DD0` ENTRY (after `sub_14060B390` rebuild, before a4 copy). Cascades
+  read the resulting a4, so they stay coherent.
+- Note the producer a4 pos row is f64 `(-5059,179,-271,1)` (world units ≈ 1cm/unit); the `S+0x650`
+  rows here are f32. Validate by reading `S+0x670` (forward row) — it should match the live world
+  forward `(-0.965,0.017,0.261)` BEFORE injection.
+
+## Cite-ready additions
+| Symbol | EA | Role |
+|---|---|---|
+| CMultiCam vtable | `0x145E1E558` | `.?AVCMultiCam@Camera@@`, the view-source S |
+| CMultiCam builder slot0x68 | `0x1405FA880` | `*out = *(S+0x600)` (ignores input) |
+| CMultiCam world-basis producer | `0x14060B390` | builds `S+0x650..+0x680` from `*(S+0x5C0)` per frame |
+| basis-row builder | `0x1407A2430` | constructs 4 rows (trampoline; called by 0x60B390) |
+| CCamFree builder slot0x68 | `0x1407A3A00` | `*out = *(S+0x5E0)` |
+| CCamDriver/Follow builder slot0x68 | `0x1405391C0` | `*out = const [0,0,1,0]` |
+| upstream source ptr | `S+0x5C0` (1472) | car/target transform provider (vtable[+432]/[+440]) |

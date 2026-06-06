@@ -500,11 +500,16 @@ using AimGetterFn = char(__fastcall*)(void*, __int64, unsigned char);
 static std::unique_ptr<FunctionHook> g_aim_getter_hook;
 
 static char __fastcall Hook_AimGetter(void* a1, __int64 a2, unsigned char a3) {
-    if (a1 != nullptr) {
-        fh5cam::rotate_aim_lookdir(reinterpret_cast<uintptr_t>(a1));
-    }
+    // Let the getter REBUILD the camera orientation at +0x320 first, then rotate the freshly-rebuilt matrix
+    // by the head delta. Runtime scan proved +0x320 is the only orthonormal basis (= a4); the getter is its
+    // per-frame rebuilder/clobberer, so rotating POST-original (after the rebuild, before the producer reads
+    // a4 and the cascades fit) is what makes the head rotation stick for both. Anti-accumulated.
     auto original = g_aim_getter_hook->get_original<AimGetterFn>();
-    return original(a1, a2, a3);
+    const char ret = original(a1, a2, a3);
+    if (a1 != nullptr) {
+        fh5cam::apply_camdriver_head_rotation(reinterpret_cast<uintptr_t>(a1));
+    }
+    return ret;
 }
 
 bool Fh5Adapter::install_hooks() {

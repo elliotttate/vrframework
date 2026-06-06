@@ -73,6 +73,11 @@ void probe_camera(uintptr_t object);
 // with the head. Gated to poslane=proda15; anti-accumulated. Returns true if it wrote the lane.
 bool rotate_aim_lookdir(uintptr_t object);
 
+// SHADOW-COHERENT head-look (real lever). Called at the getter sub_1407A9DD0 entry with the CCamDriver.
+// Rotates the CMultiCam (*(CCamDriver+0x48)) world basis at +0x650 (right/up/forward/pos rows) by the head
+// delta and syncs the a4 source row at +0x600, so the producer view AND the shadow-cascade fit both follow.
+bool rotate_multicam_basis(uintptr_t ccam);
+
 // Called by the producer hook with pointer-looking arguments. If an argument is already the active camera
 // object, a shared-pointer control block, a ForzaMultiCam object, or a wrapper containing one, this captures
 // the concrete camera object without process-wide scanning.

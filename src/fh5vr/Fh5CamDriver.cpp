@@ -2379,10 +2379,9 @@ DWORD WINAPI WorkerThread(void*) {
         // pokerot/pokerotvs live-rotate a chosen offset. The fold-hook path is preferred for the final fix
         // (synchronous, fires per-frame while driving), but the worker is what lets us FIND the source now.
         probe_camera(object_to_use);
-        // NOTE: head-look rotation is now applied at the camera pose getter sub_1407A9DD0 (Hook_AimGetter ->
-        // rotate_aim_lookdir on +0x540), NOT here. +0x320 is a per-frame-rebuilt copy (the getter rebuilds it
-        // from the look-at +0x540 lane), so rotating +0x320 from the worker was clobbered. The look-direction
-        // lane is the real upstream source the producer a4 and the shadow cascades both derive from.
+        // Head-look rotation is applied at the getter sub_1407A9DD0 POST-original (Hook_AimGetter ->
+        // apply_camdriver_head_rotation on +0x320), i.e. right after the getter rebuilds the orientation,
+        // beating the per-frame clobber. NOT from the worker (async writes lose to the getter's rebuild).
 
         const float class_priority = layout.class_priority;
         if (!writer_active) {
@@ -2755,7 +2754,7 @@ void probe_camera(uintptr_t object) {
                          object, vs, have_hint ? 1 : 0, hint.forward.x, hint.forward.y, hint.forward.z);
             const auto scan = [&](uintptr_t base, const char* tag) {
                 if (base < 0x10000ull) return;
-                for (uintptr_t off = 0; off <= 0x640; off += 4) {
+                for (uintptr_t off = 0; off <= 0x720; off += 4) {
                     Matrix4 m{};
                     if (!SafeCopyIn(base + off, m.m.data(), sizeof(float) * m.m.size())) break;
                     Pose p{};
@@ -2850,6 +2849,90 @@ bool rotate_aim_lookdir(uintptr_t object) {
     };
     if (!SafeCopyOut(object + kInputOffsetLane, &out, sizeof(out))) return false;
     g_aim_written = out;
+    return true;
+}
+
+// Anti-accumulation cache for the CMultiCam world basis (S+0x650).
+static uintptr_t g_mc_obj = 0;
+static Matrix4 g_mc_base{};
+static Matrix4 g_mc_written{};
+
+// SHADOW-COHERENT head-look (the real lever, RE fh5_empress_viewsource_orientation_RE.md ROUND-2).
+// The builder slot[0x68] ignores +0x540 — the world camera basis lives in the CMultiCam view-source
+// S=*(CCamDriver+0x48): row0/right @S+0x650, row1/up @+0x660, row2/forward @+0x670, row3/pos @+0x680
+// (row-vector, row-major), rebuilt each frame from the car. S+0x600 is the row handed to the producer a4.
+// The shadow cascades fit from that same basis. Rotating the 3x3 by the head delta here (getter entry, after
+// the rebuild, before a4 copy) turns the view AND the cascades. pos (row3) preserved (translation lever owns
+// it). Anti-accumulated so a static basis doesn't spin.
+bool rotate_multicam_basis(uintptr_t ccam) {
+    if (ccam < 0x10000ull) return false;
+    if (fh5cb::ctl_pos_lane() != fh5cb::kPosLaneProducerA15) return false;
+
+    uintptr_t S = 0;
+    if (!SafeRead(ccam + 0x48, S) || S < 0x10000ull) return false;
+
+    float strafe = 0.0f, up = 0.0f, fwd = 0.0f;
+    Pose delta{};
+    int eye = 0;
+    if (!SnapshotOpenXrPose(strafe, up, fwd, delta, eye)) return false;
+
+    Matrix4 M{};   // S+0x650: right(row0)/up(row1)/forward(row2)/pos(row3)
+    if (!SafeCopyIn(S + 0x650, M.m.data(), sizeof(float) * M.m.size())) return false;
+    const Vec3 r0{ M.m[0], M.m[1], M.m[2] };
+    const Vec3 r1{ M.m[4], M.m[5], M.m[6] };
+    const Vec3 r2{ M.m[8], M.m[9], M.m[10] };
+    if (!LooksLikeRotationBasis(r0, r1, r2)) return false;   // only touch a genuine orthonormal basis
+
+    Matrix4 base{};
+    if (g_mc_obj != S) {
+        g_mc_obj = S;
+        base = M;
+        g_mc_base = M;
+    } else if (MatricesClose16(M, g_mc_written, 1e-3f)) {
+        base = g_mc_base;   // engine didn't rebuild this frame -> reuse clean base
+    } else {
+        base = M;
+        g_mc_base = M;       // fresh car-derived basis
+    }
+
+    Vec4 mirror{};
+    const bool have_mirror = SafeCopyIn(S + 0x600, &mirror, sizeof(mirror));
+
+    Matrix4 R{};
+    R.m[0]  = delta.right.x;   R.m[1]  = delta.right.y;   R.m[2]  = delta.right.z;   R.m[3]  = 0.0f;
+    R.m[4]  = delta.up.x;      R.m[5]  = delta.up.y;      R.m[6]  = delta.up.z;      R.m[7]  = 0.0f;
+    R.m[8]  = delta.forward.x; R.m[9]  = delta.forward.y; R.m[10] = delta.forward.z; R.m[11] = 0.0f;
+    R.m[12] = 0.0f;            R.m[13] = 0.0f;            R.m[14] = 0.0f;            R.m[15] = 1.0f;
+
+    const Matrix4 Mp = MulRowVector(R, base);   // rotate basis rows 0-2; row3 (pos) preserved
+    if (!SafeCopyOut(S + 0x650, Mp.m.data(), sizeof(float) * Mp.m.size())) return false;
+    g_mc_written = Mp;
+
+    // Sync S+0x600 (the row fed to a4): detect which base row it mirrors, write the rotated counterpart.
+    int mr = -1;
+    if (have_mirror) {
+        for (int r = 0; r < 3; ++r) {
+            if (std::fabs(base.m[r * 4] - mirror.x) < 2e-3f &&
+                std::fabs(base.m[r * 4 + 1] - mirror.y) < 2e-3f &&
+                std::fabs(base.m[r * 4 + 2] - mirror.z) < 2e-3f) { mr = r; break; }
+        }
+        if (mr >= 0) {
+            const Vec4 nm{ Mp.m[mr * 4], Mp.m[mr * 4 + 1], Mp.m[mr * 4 + 2], mirror.w };
+            SafeCopyOut(S + 0x600, &nm, sizeof(nm));
+        }
+    }
+
+    {   // ~1/s verify log: confirm S+0x650 basis (row2=forward should match the producer a4 forward) + mirror row
+        static uint64_t s_last = 0;
+        const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5MCROT] S=0x{:X} base_fwd=({:.3f},{:.3f},{:.3f}) base_right=({:.3f},{:.3f},{:.3f}) "
+                         "mirror600=({:.3f},{:.3f},{:.3f}) mirrorRow={} rotApplied=1",
+                         S, base.m[8], base.m[9], base.m[10], base.m[0], base.m[1], base.m[2],
+                         mirror.x, mirror.y, mirror.z, mr);
+        }
+    }
     return true;
 }
 
