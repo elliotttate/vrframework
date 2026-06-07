@@ -123,6 +123,28 @@ The following items require a RenderDoc frame or a live proxy/capture log:
 
 That is now the hard boundary: static RE can tell us where to classify UI state and which renderer families to inspect, but the actual quad texture source must be chosen from capture evidence.
 
+## ★★ 2026-06-06 — CAPTURE RE RESOLVED: it's CASE B (no UI RT). Redirect plan below.
+
+Indexed `ForzaLookingRightCockpit.rdc` (analysis/rdc_lookright). Present = backbuffer `ResourceId::45167` (1152x864 R8G8B8A8_UNORM), eventId 31603. **Only 32 draws write to 45167, all late (30788..31581):**
+- **30788 (idx=3 fullscreen): WORLD composite/tonemap into 45167** → after this, 45167 = CLEAN WORLD. PSO `3906`, VS `1092`, PS `3908` (hash `7783d9572effba0fdc5cceecdcd40315`).
+- **30983..31581: the UI, drawn DIRECTLY into 45167** (idx=30 HUD quads ×~25, idx=972 minimap, idx=1251/1431/306 text ×2). First UI draw 30983 = VS `14006`/GS `14007`/PS `14008`. Helper textures are tiny (minimap 180², icons, 20² glyph) — no full-screen UI layer.
+
+So there is NO separate UI render target. Chosen fix (user, 2026-06-06): **UI-draw REDIRECT.**
+
+### Redirect implementation plan (mod side; gated by `uiredirect=on`, default off)
+- **New: hook the D3D12 COMMAND-LIST vtable** (mod currently only hooks the DEVICE vtable in Fh5CameraCbuffer). Grab the cmd-list vtable from a list the mod already creates (ResourceCopier), or hook CreateCommandList. Hook **`OMSetRenderTargets` (vtable index 46)**.
+- **RTV→resource map:** hook DEVICE **`CreateRenderTargetView` (index 20)** to record `rtvHandle.ptr -> resource`. At install, fetch all swapchain backbuffers (`swapchain->GetBuffer(0..N)`) so OMSetRenderTargets can tell "is this RTV the backbuffer?".
+- **Redirect logic in OMSetRenderTargets:** if `uiredirect` && the bound RTV resolves to a swapchain backbuffer && we are PAST the world-composite (1st backbuffer bind of the frame), substitute our own **UI RT's RTV handle** (keep/clear the DSV). On the FIRST redirect of the frame, `cmdList->ClearRenderTargetView(uiRtv, {0,0,0,0})` (transparent) on FH5's own list.
+- **UI RT:** backbuffer-sized RGBA8 + RTV in a mod-owned heap; lives in RENDER_TARGET state.
+- **Result:** 45167 = clean world (→ EYES, no change to the eye copy), UI RT = UI+alpha (→ the quad; `copy_hud` source switches from backbuffer to the UI RT; `hudopaque=off`).
+- Frame reset at Present (on_post_present / producer): reset the backbuffer-bind counter.
+
+### HARD PARTS to solve carefully (crash/correctness risk — NVIDIA VEH escalates ANY first-chance AV):
+1. **Multi-command-list / multi-thread ordering:** the "1st backbuffer bind = composite, rest = UI" heuristic assumes RECORD order == EXECUTE order. FH5 may record on several lists/threads; ExecuteCommandLists order ≠ record order. SAFER signal: identify the composite by its FULLSCREEN nature (a 3-vertex DrawInstanced, or PSO/PS-hash `7783d957`) and only redirect backbuffer binds whose subsequent draw is NOT that — i.e., may need to also hook DrawInstanced/DrawIndexedInstanced (index 12/13) to confirm phase per-list. Start with the bind-count heuristic behind the knob; validate live; escalate to draw/PSO identification if it mis-splits.
+2. **RTV handle validity:** the substituted handle must be a valid RTV descriptor (non-shader-visible RTV heap, mod-owned). 
+3. **State/barriers:** the UI RT must be RENDER_TARGET when bound; clear once per frame.
+4. **All hook bodies must be AV-proof** (no deref of unmapped memory) — first-chance AVs crash via the NVIDIA overlay VEH ([[fh5-nvidia-veh-crash]]).
+
 ## What we already know from previous captures
 
 The existing RenderDoc audit has not identified exact flat-HUD draw EIDs or PSOs yet. It did prove a useful separation:
