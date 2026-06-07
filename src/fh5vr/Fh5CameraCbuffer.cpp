@@ -474,46 +474,86 @@ HRESULT WINAPI Hook_CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID
     return hr;
 }
 
-// ---- UI-draw redirect: OMSetRenderTargets hook + UI render target ----------------------------------
+// ---- UI-draw redirect: OMSetRenderTargets + DrawIndexedInstanced hooks + UI render target -----------
+// Strategy (draw-level, scene-robust): OMSetRenderTargets RECORDS the per-command-list binding (is the
+// backbuffer bound? + its RTV/DSV handles). DrawIndexedInstanced then redirects ONLY large backbuffer
+// draws (the UI: idx>=30) to the UI RT, restoring the backbuffer binding afterwards — so the tiny 3-index
+// fullscreen WORLD COMPOSITE stays on the backbuffer (eyes=clean world) while the HUD/menus land on the UI
+// RT (quad). Index count, not bind order, is the discriminator (the bind-order heuristic mis-split scenes).
 using FnOMSetRT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
     const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
-std::unique_ptr<FunctionHook> g_hk_omsetrt;
+using FnDrawIdx = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+std::unique_ptr<FunctionHook> g_hk_omsetrt, g_hk_drawidx;
 std::atomic<bool> g_uir_installed{ false };
 ID3D12Resource*       g_uir_ui_rt = nullptr;      // UI-only RT (alpha); process-lifetime singleton
 ID3D12DescriptorHeap* g_uir_rtv_heap = nullptr;
 D3D12_CPU_DESCRIPTOR_HANDLE g_uir_ui_rtv{};
 std::atomic<bool>     g_uir_rt_valid{ false };
-std::atomic<int>      g_uir_bb_binds{ 0 };        // backbuffer binds seen this frame (record order)
 std::atomic<bool>     g_uir_cleared{ false };     // UI RT cleared this frame
-std::atomic<uint64_t> g_uir_redirects{ 0 };       // total UI binds redirected (diagnostic)
+std::atomic<uint64_t> g_uir_redirects{ 0 };       // total UI draws redirected (diagnostic)
+constexpr UINT kUiIdxThreshold = 12;              // composite=3 (kept); UI draws idx>=30 (redirected)
+
+struct ListBinding { bool bb_bound{false}; D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv{}; bool has_dsv{false}; D3D12_CPU_DESCRIPTOR_HANDLE dsv{}; };
+std::mutex g_uir_state_mtx;
+std::unordered_map<ID3D12GraphicsCommandList*, ListBinding> g_uir_list_state;
+
+void RecordListBinding(ID3D12GraphicsCommandList* list, bool bb, D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+                       bool has_dsv, D3D12_CPU_DESCRIPTOR_HANDLE dsv) {
+    std::scoped_lock lk(g_uir_state_mtx);
+    ListBinding& s = g_uir_list_state[list];
+    s.bb_bound = bb; s.bb_rtv = rtv; s.has_dsv = has_dsv; s.dsv = dsv;
+}
+bool GetListBinding(ID3D12GraphicsCommandList* list, ListBinding& out) {
+    std::scoped_lock lk(g_uir_state_mtx);
+    auto it = g_uir_list_state.find(list);
+    if (it == g_uir_list_state.end()) return false;
+    out = it->second; return true;
+}
 
 void STDMETHODCALLTYPE Hook_OMSetRT(ID3D12GraphicsCommandList* self, UINT num,
     const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     auto orig = g_hk_omsetrt->get_original<FnOMSetRT>();
-    D3D12_CPU_DESCRIPTOR_HANDLE local[8];
-    const D3D12_CPU_DESCRIPTOR_HANDLE* useRts = rts;
-    UINT useNum = num; BOOL useSingle = single;
+    orig(self, num, rts, single, dsv);   // bind normally; we only RECORD here
     __try {
-        if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && g_uir_rt_valid.load(std::memory_order_relaxed)
-            && num >= 1 && rts) {
-            const bool isBB = IsBackbufferRtv((size_t)rts[0].ptr);
-            if (isBB) {
-                const int n = g_uir_bb_binds.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (n >= 2) {   // past the fullscreen world composite (1st backbuffer bind) -> UI -> redirect
-                    if (!g_uir_cleared.exchange(true, std::memory_order_relaxed)) {
-                        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                        self->ClearRenderTargetView(g_uir_ui_rtv, zero, 0, nullptr);
-                    }
-                    const UINT cnt = (single || num > 8) ? 1u : num;   // single-range/overflow -> bind only our RT
-                    for (UINT i = 0; i < cnt; ++i) local[i] = (i < num) ? rts[i] : rts[0];
-                    local[0] = g_uir_ui_rtv;                            // replace the backbuffer with the UI RT
-                    useRts = local; useNum = cnt; useSingle = FALSE;
-                    g_uir_redirects.fetch_add(1, std::memory_order_relaxed);
+        if (g_uir_rt_valid.load(std::memory_order_relaxed)) {
+            const bool bb = (num >= 1 && rts && IsBackbufferRtv((size_t)rts[0].ptr));
+            RecordListBinding(self, bb, (num >= 1 && rts) ? rts[0] : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                              dsv != nullptr, dsv ? *dsv : D3D12_CPU_DESCRIPTOR_HANDLE{});
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+std::atomic<uint32_t> g_uir_bbdraw_count{ 0 };   // diagnostic: backbuffer-bound DrawIndexed calls / frame
+std::atomic<uint32_t> g_uir_bbdraw_maxidx{ 0 };  // diagnostic: largest idxCount among them
+
+void STDMETHODCALLTYPE Hook_DrawIdx(ID3D12GraphicsCommandList* self, UINT idxCount, UINT instCount,
+    UINT startIdx, INT baseVtx, UINT startInst) {
+    auto orig = g_hk_drawidx->get_original<FnDrawIdx>();
+    bool redirected = false;
+    __try {
+        if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && g_uir_rt_valid.load(std::memory_order_relaxed)) {
+            ListBinding s;
+            const bool bb = GetListBinding(self, s) && s.bb_bound;
+            if (bb) {   // diagnostic: characterize backbuffer-bound draw sizes
+                g_uir_bbdraw_count.fetch_add(1, std::memory_order_relaxed);
+                uint32_t cur = g_uir_bbdraw_maxidx.load(std::memory_order_relaxed);
+                while (idxCount > cur && !g_uir_bbdraw_maxidx.compare_exchange_weak(cur, idxCount, std::memory_order_relaxed)) {}
+            }
+            if (bb && idxCount > kUiIdxThreshold) {   // a large draw into the backbuffer == UI
+                if (!g_uir_cleared.exchange(true, std::memory_order_relaxed)) {
+                    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    self->ClearRenderTargetView(g_uir_ui_rtv, zero, 0, nullptr);
                 }
+                auto omset = g_hk_omsetrt->get_original<FnOMSetRT>();
+                omset(self, 1, &g_uir_ui_rtv, FALSE, s.has_dsv ? &s.dsv : nullptr);   // -> UI RT
+                orig(self, idxCount, instCount, startIdx, baseVtx, startInst);        // draw the UI element
+                omset(self, 1, &s.bb_rtv, FALSE, s.has_dsv ? &s.dsv : nullptr);       // restore backbuffer
+                g_uir_redirects.fetch_add(1, std::memory_order_relaxed);
+                redirected = true;
             }
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { useRts = rts; useNum = num; useSingle = single; }
-    orig(self, useNum, useRts, useSingle, dsv);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { redirected = false; }
+    if (!redirected) orig(self, idxCount, instCount, startIdx, baseVtx, startInst);
 }
 
 } // namespace
@@ -583,25 +623,32 @@ void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain) {
     if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) && alloc &&
         SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl))) && cl) {
         void** cvt = *reinterpret_cast<void***>(cl);
-        g_hk_omsetrt = std::make_unique<FunctionHook>(Address{ cvt[46] }, &Hook_OMSetRT);
+        g_hk_omsetrt = std::make_unique<FunctionHook>(Address{ cvt[46] }, &Hook_OMSetRT);     // OMSetRenderTargets
+        g_hk_drawidx = std::make_unique<FunctionHook>(Address{ cvt[13] }, &Hook_DrawIdx);     // DrawIndexedInstanced
         if (!g_hk_omsetrt->create()) { g_hk_omsetrt.reset(); spdlog::warn("[FH5UIR] OMSetRenderTargets hook FAILED"); }
+        if (!g_hk_drawidx->create()) { g_hk_drawidx.reset(); spdlog::warn("[FH5UIR] DrawIndexedInstanced hook FAILED"); }
     }
     if (cl) cl->Release();
     if (alloc) alloc->Release();
 
-    g_uir_rt_valid.store(g_hk_omsetrt != nullptr, std::memory_order_release);
-    spdlog::info("[FH5UIR] installed: UI RT {}x{} bbRTVs={} omsetrt={}", w, h, g_uir_bb_rtvs.size(), g_hk_omsetrt ? 1 : 0);
+    g_uir_rt_valid.store(g_hk_omsetrt != nullptr && g_hk_drawidx != nullptr, std::memory_order_release);
+    spdlog::info("[FH5UIR] installed: UI RT {}x{} bbRTVs={} omsetrt={} drawidx={}",
+                 w, h, g_uir_bb_rtvs.size(), g_hk_omsetrt ? 1 : 0, g_hk_drawidx ? 1 : 0);
 }
 
 void ui_redirect_on_present() {
     static uint64_t s_last_log = 0;
-    const int binds = g_uir_bb_binds.exchange(0, std::memory_order_relaxed);
-    g_uir_cleared.store(false, std::memory_order_relaxed);
+    static uint64_t s_last_redirects = 0;
+    g_uir_cleared.store(false, std::memory_order_relaxed);   // re-clear the UI RT next frame
     const uint64_t now = GetTickCount64();
+    const uint32_t bbdraws = g_uir_bbdraw_count.exchange(0, std::memory_order_relaxed);
+    const uint32_t maxidx = g_uir_bbdraw_maxidx.exchange(0, std::memory_order_relaxed);
     if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && now - s_last_log >= 1000) {
         s_last_log = now;
-        spdlog::info("[FH5UIR] frame: backbuffer binds={} (1=composite, rest redirected) totalRedirects={}",
-                     binds, g_uir_redirects.load(std::memory_order_relaxed));
+        const uint64_t tot = g_uir_redirects.load(std::memory_order_relaxed);
+        spdlog::info("[FH5UIR] frame: bbDraws={} maxIdx={} redirected~{}/frame (total {})",
+                     bbdraws, maxidx, tot - s_last_redirects, tot);
+        s_last_redirects = tot;
     }
 }
 
