@@ -88,6 +88,23 @@ private:
         std::vector<SwapchainContext> contexts{};
         std::recursive_mutex mtx{};
         std::array<uint32_t, 2> last_resolution{};
+
+        // --- UI/HUD quad layer (separate from the eye swapchains) -------------------------------------
+        // A single swapchain whose image is submitted each frame as a head-locked XrCompositionLayerQuad in
+        // view_space, so the flat UI/menus float on a panel instead of being stereo-warped into both eyes.
+        // Kept OUT of openxr->swapchains (that vector is the projection-layer eye set). Created in
+        // create_swapchains, populated + submitted in on_frame when fh5cb::ctl_hud_quad() is on.
+        std::optional<std::string> create_hud_swapchain(VR* vr, ID3D12Device* device,
+                                                        uint32_t width, uint32_t height, DXGI_FORMAT xr_fmt);
+        // Acquire/wait/copy/release the HUD swapchain image from `src`. Returns true if an image was released
+        // (so the caller may reference hud_handle in a quad layer this frame).
+        bool copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue);
+
+        XrSwapchain hud_handle{XR_NULL_HANDLE};
+        int32_t hud_width{0};
+        int32_t hud_height{0};
+        SwapchainContext hud_ctx{};
+        bool hud_ready{false};
     } m_openxr;
 
     std::array<ResourceCopier, 3> m_generic_copiers{}; // desktop-mirror / scratch copies

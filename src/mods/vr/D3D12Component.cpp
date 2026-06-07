@@ -8,6 +8,7 @@
 #include "mods/VR.hpp"
 #include "mods/vr/D3D12Component.hpp"
 #include "../../fh5vr/Fh5Adapter.hpp"
+#include "../../fh5vr/Fh5CameraCbuffer.hpp"
 
 namespace vrmod {
 
@@ -232,12 +233,47 @@ bool D3D12Component::on_frame(VR* vr) {
             vr->m_openxr->begin_frame();
         }
 
-        auto result = vr->m_openxr->end_frame();
+        // UI/HUD quad layer (gated by hudquad=on). Copy the chosen UI source into the HUD swapchain and
+        // submit it as a head-locked quad in view_space alongside the eye projection. INITIAL source = the
+        // engine backbuffer (proves swapchain/copy/quad/compositing end-to-end with a recognizable image);
+        // this is replaced by the UI-only texture once FH5's UI render target is identified. hud_quad must
+        // outlive the end_frame call below, so it is declared here in the submit scope.
+        std::vector<XrCompositionLayerBaseHeader*> extra_layers{};
+        XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        if (fh5cb::ctl_hud_quad() && m_openxr.copy_hud(vr, eye_texture, device, command_queue)) {
+            const float aspect = (m_openxr.hud_height > 0)
+                ? (float)m_openxr.hud_width / (float)m_openxr.hud_height : (16.0f / 9.0f);
+            const float quad_w = fh5cb::ctl_hud_w();        // metres wide (live-tunable)
+            const float quad_h = quad_w / aspect;           // aspect-correct height
+            // Opaque during backbuffer validation (the backbuffer alpha may be 0 -> a source-alpha quad would
+            // be fully transparent/invisible). Switch to source-alpha once the quad source is a real UI texture.
+            hud_quad.layerFlags = fh5cb::ctl_hud_opaque() ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            hud_quad.space = vr->m_openxr->view_space;       // head-locked panel
+            hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            hud_quad.subImage.swapchain = m_openxr.hud_handle;
+            hud_quad.subImage.imageArrayIndex = 0;
+            hud_quad.subImage.imageRect.offset = {0, 0};
+            hud_quad.subImage.imageRect.extent = {m_openxr.hud_width, m_openxr.hud_height};
+            hud_quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            hud_quad.pose.position = {fh5cb::ctl_hud_x(), fh5cb::ctl_hud_y(), fh5cb::ctl_hud_z()};
+            hud_quad.size = {quad_w, quad_h};
+            extra_layers.push_back((XrCompositionLayerBaseHeader*)&hud_quad);
+            static std::atomic<uint64_t> s_hud_log_ms{0};
+            const uint64_t now_ms = ::GetTickCount64();
+            uint64_t last_ms = s_hud_log_ms.load(std::memory_order_relaxed);
+            if (now_ms - last_ms >= 2000 && s_hud_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+                spdlog::info("[VR-HUDQUAD] quad {:.2f}x{:.2f}m pos=({:.2f},{:.2f},{:.2f}) opaque={} (swapchain {}x{})",
+                    quad_w, quad_h, fh5cb::ctl_hud_x(), fh5cb::ctl_hud_y(), fh5cb::ctl_hud_z(),
+                    fh5cb::ctl_hud_opaque() ? 1 : 0, m_openxr.hud_width, m_openxr.hud_height);
+            }
+        }
+
+        auto result = vr->m_openxr->end_frame(extra_layers);
 
         if (result == XR_ERROR_LAYER_INVALID) {
-            spdlog::info("[VR] Correcting invalid layer; waiting for all copies then retrying xrEndFrame");
+            spdlog::info("[VR] Correcting invalid layer; waiting for all copies then retrying xrEndFrame (eyes only)");
             m_openxr.wait_for_all_copies();
-            result = vr->m_openxr->end_frame();
+            result = vr->m_openxr->end_frame();   // retry without the quad in case it was the invalid layer
         }
 
         vr->m_openxr->needs_pose_update = true;
@@ -419,6 +455,64 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains(VR* vr) {
     }
 
     this->last_resolution = {width, height};
+
+    // UI/HUD quad swapchain (separate from the eye set). RGBA8 sRGB so it carries alpha for the UI and the
+    // compositor decodes sRGB correctly; sized to the backbuffer for a 1:1 CopyResource (the initial quad
+    // source is the engine backbuffer to validate the path, later the UI-only texture). Non-fatal on failure.
+    if (auto hud_err = create_hud_swapchain(vr, device, width, height, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+        spdlog::warn("[VR] HUD quad swapchain not created: {} (eye rendering unaffected)", *hud_err);
+    }
+
+    return std::nullopt;
+}
+
+std::optional<std::string> D3D12Component::OpenXR::create_hud_swapchain(VR* vr, ID3D12Device* device,
+                                                                       uint32_t width, uint32_t height,
+                                                                       DXGI_FORMAT xr_fmt) {
+    std::scoped_lock _{this->mtx};
+    this->hud_ready = false;
+
+    auto& openxr = vr->m_openxr;
+    if (openxr == nullptr || device == nullptr) {
+        return "no device/runtime";
+    }
+
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.arraySize = 1;
+    ci.format = xr_fmt;
+    ci.width = width;
+    ci.height = height;
+    ci.mipCount = 1;
+    ci.faceCount = 1;
+    ci.sampleCount = 1;
+    ci.usageFlags =
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+
+    if (xrCreateSwapchain(openxr->session, &ci, &this->hud_handle) != XR_SUCCESS) {
+        this->hud_handle = XR_NULL_HANDLE;
+        return "xrCreateSwapchain (HUD) failed";
+    }
+    this->hud_width = (int32_t)width;
+    this->hud_height = (int32_t)height;
+
+    uint32_t image_count{};
+    if (xrEnumerateSwapchainImages(this->hud_handle, 0, &image_count, nullptr) != XR_SUCCESS) {
+        return "enumerate HUD images failed";
+    }
+    this->hud_ctx.textures.assign(image_count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    this->hud_ctx.copiers.clear();
+    this->hud_ctx.copiers.resize(image_count);
+    for (uint32_t j = 0; j < image_count; ++j) {
+        this->hud_ctx.copiers[j] = std::make_unique<ResourceCopier>();
+        this->hud_ctx.copiers[j]->setup(device, L"OpenXR HUD quad copier");
+    }
+    if (xrEnumerateSwapchainImages(this->hud_handle, image_count, &image_count,
+            (XrSwapchainImageBaseHeader*)this->hud_ctx.textures.data()) != XR_SUCCESS) {
+        return "enumerate HUD images (2) failed";
+    }
+
+    this->hud_ready = true;
+    spdlog::info("[VR] HUD quad swapchain created ({}x{}, {} images, fmt {})", width, height, image_count, (int)xr_fmt);
     return std::nullopt;
 }
 
@@ -446,6 +540,15 @@ void D3D12Component::OpenXR::destroy_swapchains(VR* vr) {
     this->contexts.clear();
     if (openxr != nullptr) {
         openxr->swapchains.clear();
+    }
+
+    // HUD quad swapchain.
+    this->hud_ready = false;
+    this->hud_ctx.copiers.clear();
+    this->hud_ctx.textures.clear();
+    if (this->hud_handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(this->hud_handle);
+        this->hud_handle = XR_NULL_HANDLE;
     }
 }
 
@@ -536,6 +639,49 @@ void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource
     }
 
     ctx.num_textures_acquired--;
+}
+
+bool D3D12Component::OpenXR::copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue) {
+    std::scoped_lock _{this->mtx};
+
+    auto& openxr = vr->m_openxr;
+    if (!this->hud_ready || this->hud_handle == XR_NULL_HANDLE || openxr == nullptr || src == nullptr) {
+        return false;
+    }
+    if (openxr->frame_state.shouldRender != XR_TRUE || !openxr->frame_began) {
+        return false;
+    }
+
+    uint32_t texture_index{};
+    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    auto result = xrAcquireSwapchainImage(this->hud_handle, &acquire_info, &texture_index);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[VR] HUD xrAcquireSwapchainImage failed: {}", openxr->get_result_string(result));
+        return false;
+    }
+
+    XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait_info.timeout = XR_INFINITE_DURATION;
+    result = xrWaitSwapchainImage(this->hud_handle, &wait_info);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[VR] HUD xrWaitSwapchainImage failed: {}", openxr->get_result_string(result));
+        return false;
+    }
+
+    auto& copier = this->hud_ctx.copiers[texture_index];
+    copier->wait(INFINITE);
+    // src is the engine backbuffer (PRESENT) for the initial path-validation; later this is the UI texture.
+    copier->copy(src, this->hud_ctx.textures[texture_index].texture,
+                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    copier->execute(queue);
+
+    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    result = xrReleaseSwapchainImage(this->hud_handle, &release_info);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[VR] HUD xrReleaseSwapchainImage failed: {}", openxr->get_result_string(result));
+        return false;
+    }
+    return true;
 }
 
 } // namespace vrmod

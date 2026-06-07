@@ -50,6 +50,12 @@ std::atomic<int>   g_ctl_recenter_seq{ 0 };
 std::atomic<int>   g_ctl_pokerot{ -1 };     // rotate the orthonormal 4x4 at active_cam + offset by head delta (-1=off)
 std::atomic<int>   g_ctl_pokerotvs{ -1 };   // rotate the orthonormal 4x4 at (*(active_cam+0x48)) + offset (-1=off)
 std::atomic<bool>  g_ctl_dumpcam{ false };  // scan active_cam + view-source for orthonormal matrices; log offsets + basisScore
+std::atomic<bool>  g_ctl_hud_quad{ false }; // submit the UI/HUD as a head-locked OpenXR quad layer (hudquad=on)
+std::atomic<bool>  g_ctl_hud_opaque{ true }; // hudopaque=on -> opaque quad (no source-alpha blend); for backbuffer validation
+std::atomic<float> g_ctl_hud_w{ 1.6f };      // quad width in metres (height derives from texture aspect)
+std::atomic<float> g_ctl_hud_x{ 0.0f };      // quad centre offset (metres) in view space: +x right
+std::atomic<float> g_ctl_hud_y{ 0.0f };      // +y up
+std::atomic<float> g_ctl_hud_z{ -1.8f };     // -z forward (distance in front of the head)
 
 // UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
 // argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
@@ -90,6 +96,24 @@ void poll_control_file() {
                 strncmp(line + 5, "true", 4) == 0;
             g_ctl_projection.store(enabled, std::memory_order_relaxed);
         }
+        else if (strncmp(line, "hudquad=", 8) == 0) {
+            const bool enabled =
+                strncmp(line + 8, "on", 2) == 0 ||
+                strncmp(line + 8, "1", 1) == 0 ||
+                strncmp(line + 8, "true", 4) == 0;
+            g_ctl_hud_quad.store(enabled, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "hudopaque=", 10) == 0) {
+            const bool enabled =
+                strncmp(line + 10, "on", 2) == 0 ||
+                strncmp(line + 10, "1", 1) == 0 ||
+                strncmp(line + 10, "true", 4) == 0;
+            g_ctl_hud_opaque.store(enabled, std::memory_order_relaxed);
+        }
+        else if (sscanf_s(line, "hudw=%f", &v) == 1)    g_ctl_hud_w.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "hudx=%f", &v) == 1)    g_ctl_hud_x.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "hudy=%f", &v) == 1)    g_ctl_hud_y.store(v, std::memory_order_relaxed);
+        else if (sscanf_s(line, "hudz=%f", &v) == 1)    g_ctl_hud_z.store(v, std::memory_order_relaxed);
         else if (strncmp(line, "poslane=", 8) == 0) {
             if      (strncmp(line + 8, "camsrc", 6)         == 0) iv = kPosLaneCamSrc;
             else if (strncmp(line + 8, "proda15", 7)        == 0) iv = kPosLaneProducerA15;
@@ -455,6 +479,12 @@ int   ctl_pos_lane()    { return g_ctl_pos_lane.load(std::memory_order_relaxed);
 int   ctl_pokerot()     { return g_ctl_pokerot.load(std::memory_order_relaxed); }
 int   ctl_pokerotvs()   { return g_ctl_pokerotvs.load(std::memory_order_relaxed); }
 bool  ctl_dumpcam()     { return g_ctl_dumpcam.load(std::memory_order_relaxed); }
+bool  ctl_hud_quad()    { return g_ctl_hud_quad.load(std::memory_order_relaxed); }
+bool  ctl_hud_opaque()  { return g_ctl_hud_opaque.load(std::memory_order_relaxed); }
+float ctl_hud_w()       { return g_ctl_hud_w.load(std::memory_order_relaxed); }
+float ctl_hud_x()       { return g_ctl_hud_x.load(std::memory_order_relaxed); }
+float ctl_hud_y()       { return g_ctl_hud_y.load(std::memory_order_relaxed); }
+float ctl_hud_z()       { return g_ctl_hud_z.load(std::memory_order_relaxed); }
 const char* pos_lane_name(int lane) {
     switch (lane) {
     case kPosLaneCcam320: return "ccam320";

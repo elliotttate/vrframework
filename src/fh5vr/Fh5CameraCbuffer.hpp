@@ -72,6 +72,12 @@ const char* pos_lane_name(int lane);
 int ctl_pokerot();      // runtime probe: active_cam offset to basis-rotate (-1=off)
 int ctl_pokerotvs();    // runtime probe: view-source(*(cam+0x48)) offset to basis-rotate (-1=off)
 bool ctl_dumpcam();     // runtime probe: dump orthonormal-matrix offsets on cam + view-source
+bool ctl_hud_quad();    // submit the UI/HUD as a head-locked OpenXR quad layer (hudquad=on)
+bool ctl_hud_opaque();  // hudopaque=on -> opaque quad (no source-alpha blend)
+float ctl_hud_w();      // quad width (metres); height from texture aspect
+float ctl_hud_x();      // quad centre offset in view space (metres): +x right
+float ctl_hud_y();      // +y up
+float ctl_hud_z();      // -z forward (distance in front of the head)
 
 // UPSTREAM camera-translation test (constant camera-relative offset applied in the producer hook to find
 // which argument is the real camera-position lever, with shadows/derived data following). tgt: 0=off,
