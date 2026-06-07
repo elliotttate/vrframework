@@ -439,6 +439,51 @@ void STDMETHODCALLTYPE Hook_RTV(ID3D12Device* self, ID3D12Resource* res,
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---------------------------------------------------------------------------
+// UI-draw redirect: classify PSOs by their pixel shader. The world composite (fullscreen tonemap into the
+// backbuffer) has PS DXBC-container hash 97 74 ba 97 ... (RenderDoc reports MD5(bytecode)=7783d957...; the
+// DXBC container also embeds this 16-byte hash at offset 4, so we match it directly — no MD5 needed). PSOs
+// whose PS matches are the composite; everything else drawn into the backbuffer is UI.
+// ---------------------------------------------------------------------------
+using FnCreateGfxPSO = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+std::unique_ptr<FunctionHook> g_hk_gfxpso;
+std::mutex g_pso_mtx;
+std::unordered_set<void*> g_composite_psos;          // PSOs whose PS == the world-composite shader
+std::atomic<uint64_t> g_pso_create_count{ 0 };       // de-risk: total graphics PSOs created (vt10 coverage)
+std::atomic<uint64_t> g_composite_pso_count{ 0 };    // de-risk: how many matched the composite hash
+
+// DXBC container hash of the world-composite PS (offset 4..19 of the bytecode; == MD5(bytecode) 7783d957...).
+static const unsigned char kCompositePsHash[16] = {
+    0x97,0x74,0xBA,0x97, 0x64,0xC2,0x07,0x59, 0x05,0xEC,0x5A,0x33, 0x38,0x05,0x25,0x10 };
+
+bool PsIsComposite(const D3D12_SHADER_BYTECODE& ps) {
+    if (!ps.pShaderBytecode || ps.BytecodeLength < 20) return false;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(ps.pShaderBytecode);
+    if (!(b[0] == 'D' && b[1] == 'X' && b[2] == 'B' && b[3] == 'C')) return false;   // DXBC container
+    return memcmp(b + 4, kCompositePsHash, 16) == 0;
+}
+void RememberCompositePso(void* pso) { std::scoped_lock lk(g_pso_mtx); g_composite_psos.insert(pso); }
+bool IsCompositePso(void* pso) {
+    if (!pso) return false;
+    std::scoped_lock lk(g_pso_mtx); return g_composite_psos.count(pso) != 0;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateGfxPSO(ID3D12Device* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid, void** ppv) {
+    auto orig = g_hk_gfxpso->get_original<FnCreateGfxPSO>();
+    HRESULT hr = orig(self, desc, riid, ppv);
+    if (SUCCEEDED(hr) && ppv && *ppv && desc) {
+        g_pso_create_count.fetch_add(1, std::memory_order_relaxed);
+        __try {
+            if (PsIsComposite(desc->PS)) {
+                RememberCompositePso(*ppv);
+                g_composite_pso_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return hr;
+}
+
 std::atomic<bool> g_dev_done{ false };
 
 // Install the device buffer-tracking hooks (committed/placed/cbv). Called as early as possible — from the
@@ -450,10 +495,12 @@ void install_device_hooks(ID3D12Device* device) {
     g_hk_committed = std::make_unique<FunctionHook>(Address{ vt[27] }, &Hook_Committed);
     g_hk_placed    = std::make_unique<FunctionHook>(Address{ vt[29] }, &Hook_Placed);
     g_hk_cbv       = std::make_unique<FunctionHook>(Address{ vt[17] }, &Hook_CBV);
-    g_hk_rtv       = std::make_unique<FunctionHook>(Address{ vt[20] }, &Hook_RTV);  // CreateRenderTargetView
-    const bool ok = g_hk_committed->create() && g_hk_placed->create() && g_hk_cbv->create() && g_hk_rtv->create();
-    spdlog::info("[FH5CB] device buffer-tracking hooks {} (committed=vt27 placed=vt29 cbv=vt17 rtv=vt20)", ok ? "installed" : "FAILED");
-    if (!ok) { g_hk_committed.reset(); g_hk_placed.reset(); g_hk_cbv.reset(); g_hk_rtv.reset(); g_dev_done.store(false); }
+    g_hk_rtv       = std::make_unique<FunctionHook>(Address{ vt[20] }, &Hook_RTV);       // CreateRenderTargetView
+    g_hk_gfxpso    = std::make_unique<FunctionHook>(Address{ vt[10] }, &Hook_CreateGfxPSO); // CreateGraphicsPipelineState
+    const bool ok = g_hk_committed->create() && g_hk_placed->create() && g_hk_cbv->create()
+                    && g_hk_rtv->create() && g_hk_gfxpso->create();
+    spdlog::info("[FH5CB] device buffer-tracking hooks {} (committed=vt27 placed=vt29 cbv=vt17 rtv=vt20 gfxpso=vt10)", ok ? "installed" : "FAILED");
+    if (!ok) { g_hk_committed.reset(); g_hk_placed.reset(); g_hk_cbv.reset(); g_hk_rtv.reset(); g_hk_gfxpso.reset(); g_dev_done.store(false); }
 }
 
 // D3D12CreateDevice detour — catches the game device at creation (before the camera ring is allocated) and
@@ -474,26 +521,32 @@ HRESULT WINAPI Hook_CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID
     return hr;
 }
 
-// ---- UI-draw redirect: OMSetRenderTargets + DrawIndexedInstanced hooks + UI render target -----------
-// Strategy (draw-level, scene-robust): OMSetRenderTargets RECORDS the per-command-list binding (is the
-// backbuffer bound? + its RTV/DSV handles). DrawIndexedInstanced then redirects ONLY large backbuffer
-// draws (the UI: idx>=30) to the UI RT, restoring the backbuffer binding afterwards — so the tiny 3-index
-// fullscreen WORLD COMPOSITE stays on the backbuffer (eyes=clean world) while the HUD/menus land on the UI
-// RT (quad). Index count, not bind order, is the discriminator (the bind-order heuristic mis-split scenes).
+// ---- UI-draw redirect: PSO + frame-phase state machine -----------------------------------------------
+// Discriminator = RESOURCE (backbuffer bound) + FRAME PHASE (after the world composite) + PSO (not the
+// composite PSO). OMSetRenderTargets records the per-list backbuffer binding; SetPipelineState records the
+// per-list current PSO. In the draw hooks (BOTH DrawInstanced and DrawIndexedInstanced): a backbuffer draw
+// with the COMPOSITE PSO hits the backbuffer and flips the frame phase to "after composite"; subsequent
+// backbuffer draws with any OTHER PSO are UI -> redirected to the UI RT (binding restored after). Draw size
+// is NOT used (a UI quad and a fullscreen quad are both 6 verts; only the PSO/shader is a stable separator).
 using FnOMSetRT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
     const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
-using FnDrawIdx = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
-std::unique_ptr<FunctionHook> g_hk_omsetrt, g_hk_drawidx;
+using FnDrawIdx  = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using FnDrawInst = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using FnSetPSO   = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+std::unique_ptr<FunctionHook> g_hk_omsetrt, g_hk_drawidx, g_hk_drawinst, g_hk_setpso;
 std::atomic<bool> g_uir_installed{ false };
 ID3D12Resource*       g_uir_ui_rt = nullptr;      // UI-only RT (alpha); process-lifetime singleton
 ID3D12DescriptorHeap* g_uir_rtv_heap = nullptr;
 D3D12_CPU_DESCRIPTOR_HANDLE g_uir_ui_rtv{};
 std::atomic<bool>     g_uir_rt_valid{ false };
-std::atomic<bool>     g_uir_cleared{ false };     // UI RT cleared this frame
-std::atomic<uint64_t> g_uir_redirects{ 0 };       // total UI draws redirected (diagnostic)
-constexpr UINT kUiIdxThreshold = 12;              // composite=3 (kept); UI draws idx>=30 (redirected)
+std::atomic<bool>     g_uir_cleared{ false };          // UI RT cleared this frame
+std::atomic<bool>     g_uir_after_composite{ false };  // frame phase: world composite has run this frame
+std::atomic<uint64_t> g_uir_redirects{ 0 };            // total UI draws redirected (diagnostic)
 
-struct ListBinding { bool bb_bound{false}; D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv{}; bool has_dsv{false}; D3D12_CPU_DESCRIPTOR_HANDLE dsv{}; };
+struct ListBinding {
+    bool bb_bound{false}; D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv{}; bool has_dsv{false}; D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+    void* pso{nullptr};   // current pipeline state (from SetPipelineState)
+};
 std::mutex g_uir_state_mtx;
 std::unordered_map<ID3D12GraphicsCommandList*, ListBinding> g_uir_list_state;
 
@@ -502,6 +555,10 @@ void RecordListBinding(ID3D12GraphicsCommandList* list, bool bb, D3D12_CPU_DESCR
     std::scoped_lock lk(g_uir_state_mtx);
     ListBinding& s = g_uir_list_state[list];
     s.bb_bound = bb; s.bb_rtv = rtv; s.has_dsv = has_dsv; s.dsv = dsv;
+}
+void RecordListPso(ID3D12GraphicsCommandList* list, void* pso) {
+    std::scoped_lock lk(g_uir_state_mtx);
+    g_uir_list_state[list].pso = pso;
 }
 bool GetListBinding(ID3D12GraphicsCommandList* list, ListBinding& out) {
     std::scoped_lock lk(g_uir_state_mtx);
@@ -512,8 +569,7 @@ bool GetListBinding(ID3D12GraphicsCommandList* list, ListBinding& out) {
 
 void STDMETHODCALLTYPE Hook_OMSetRT(ID3D12GraphicsCommandList* self, UINT num,
     const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
-    auto orig = g_hk_omsetrt->get_original<FnOMSetRT>();
-    orig(self, num, rts, single, dsv);   // bind normally; we only RECORD here
+    g_hk_omsetrt->get_original<FnOMSetRT>()(self, num, rts, single, dsv);   // bind normally; we only RECORD
     __try {
         if (g_uir_rt_valid.load(std::memory_order_relaxed)) {
             const bool bb = (num >= 1 && rts && IsBackbufferRtv((size_t)rts[0].ptr));
@@ -523,37 +579,63 @@ void STDMETHODCALLTYPE Hook_OMSetRT(ID3D12GraphicsCommandList* self, UINT num,
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-std::atomic<uint32_t> g_uir_bbdraw_count{ 0 };   // diagnostic: backbuffer-bound DrawIndexed calls / frame
-std::atomic<uint32_t> g_uir_bbdraw_maxidx{ 0 };  // diagnostic: largest idxCount among them
+void STDMETHODCALLTYPE Hook_SetPSO(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso) {
+    g_hk_setpso->get_original<FnSetPSO>()(self, pso);
+    __try { if (g_uir_rt_valid.load(std::memory_order_relaxed)) RecordListPso(self, pso); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// POD so it is legal alongside __try in the draw hooks (no unwinding).
+struct RedirectScope { bool active{false}; D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv{}; bool has_dsv{false}; D3D12_CPU_DESCRIPTOR_HANDLE dsv{}; };
+
+std::atomic<uint32_t> g_dbg_bb_draws{ 0 };          // draws while the backbuffer is bound
+std::atomic<uint32_t> g_dbg_composite_draws{ 0 };   // ...of which use the composite PSO
+std::atomic<uint32_t> g_dbg_ui_draws{ 0 };          // ...after composite, non-composite PSO (=UI, redirected)
+
+RedirectScope BeginDrawRedirect(ID3D12GraphicsCommandList* self) {
+    RedirectScope sc;
+    if (!g_ctl_ui_redirect.load(std::memory_order_relaxed) || !g_uir_rt_valid.load(std::memory_order_relaxed)) return sc;
+    ListBinding s;
+    if (!GetListBinding(self, s) || !s.bb_bound) return sc;     // not drawing into the backbuffer
+    g_dbg_bb_draws.fetch_add(1, std::memory_order_relaxed);
+    if (IsCompositePso(s.pso)) {                                // the world composite: keep it, flip phase
+        g_dbg_composite_draws.fetch_add(1, std::memory_order_relaxed);
+        g_uir_after_composite.store(true, std::memory_order_relaxed);
+        return sc;
+    }
+    if (!g_uir_after_composite.load(std::memory_order_relaxed)) return sc;  // pre-composite bb draw -> leave
+    g_dbg_ui_draws.fetch_add(1, std::memory_order_relaxed);
+    // UI draw into the backbuffer, after the composite -> redirect to the UI RT.
+    if (!g_uir_cleared.exchange(true, std::memory_order_relaxed)) {
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        self->ClearRenderTargetView(g_uir_ui_rtv, zero, 0, nullptr);
+    }
+    g_hk_omsetrt->get_original<FnOMSetRT>()(self, 1, &g_uir_ui_rtv, FALSE, s.has_dsv ? &s.dsv : nullptr);
+    sc.active = true; sc.bb_rtv = s.bb_rtv; sc.has_dsv = s.has_dsv; sc.dsv = s.dsv;
+    g_uir_redirects.fetch_add(1, std::memory_order_relaxed);
+    return sc;
+}
+void EndDrawRedirect(ID3D12GraphicsCommandList* self, RedirectScope sc) {
+    if (!sc.active) return;
+    g_hk_omsetrt->get_original<FnOMSetRT>()(self, 1, &sc.bb_rtv, FALSE, sc.has_dsv ? &sc.dsv : nullptr);
+}
 
 void STDMETHODCALLTYPE Hook_DrawIdx(ID3D12GraphicsCommandList* self, UINT idxCount, UINT instCount,
     UINT startIdx, INT baseVtx, UINT startInst) {
     auto orig = g_hk_drawidx->get_original<FnDrawIdx>();
-    bool redirected = false;
-    __try {
-        if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && g_uir_rt_valid.load(std::memory_order_relaxed)) {
-            ListBinding s;
-            const bool bb = GetListBinding(self, s) && s.bb_bound;
-            if (bb) {   // diagnostic: characterize backbuffer-bound draw sizes
-                g_uir_bbdraw_count.fetch_add(1, std::memory_order_relaxed);
-                uint32_t cur = g_uir_bbdraw_maxidx.load(std::memory_order_relaxed);
-                while (idxCount > cur && !g_uir_bbdraw_maxidx.compare_exchange_weak(cur, idxCount, std::memory_order_relaxed)) {}
-            }
-            if (bb && idxCount > kUiIdxThreshold) {   // a large draw into the backbuffer == UI
-                if (!g_uir_cleared.exchange(true, std::memory_order_relaxed)) {
-                    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                    self->ClearRenderTargetView(g_uir_ui_rtv, zero, 0, nullptr);
-                }
-                auto omset = g_hk_omsetrt->get_original<FnOMSetRT>();
-                omset(self, 1, &g_uir_ui_rtv, FALSE, s.has_dsv ? &s.dsv : nullptr);   // -> UI RT
-                orig(self, idxCount, instCount, startIdx, baseVtx, startInst);        // draw the UI element
-                omset(self, 1, &s.bb_rtv, FALSE, s.has_dsv ? &s.dsv : nullptr);       // restore backbuffer
-                g_uir_redirects.fetch_add(1, std::memory_order_relaxed);
-                redirected = true;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { redirected = false; }
-    if (!redirected) orig(self, idxCount, instCount, startIdx, baseVtx, startInst);
+    RedirectScope sc;
+    __try { sc = BeginDrawRedirect(self); } __except (EXCEPTION_EXECUTE_HANDLER) { sc = RedirectScope{}; }
+    orig(self, idxCount, instCount, startIdx, baseVtx, startInst);
+    __try { EndDrawRedirect(self, sc); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void STDMETHODCALLTYPE Hook_DrawInst(ID3D12GraphicsCommandList* self, UINT vtxCount, UINT instCount,
+    UINT startVtx, UINT startInst) {
+    auto orig = g_hk_drawinst->get_original<FnDrawInst>();
+    RedirectScope sc;
+    __try { sc = BeginDrawRedirect(self); } __except (EXCEPTION_EXECUTE_HANDLER) { sc = RedirectScope{}; }
+    orig(self, vtxCount, instCount, startVtx, startInst);
+    __try { EndDrawRedirect(self, sc); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 } // namespace
@@ -623,31 +705,42 @@ void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain) {
     if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) && alloc &&
         SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl))) && cl) {
         void** cvt = *reinterpret_cast<void***>(cl);
-        g_hk_omsetrt = std::make_unique<FunctionHook>(Address{ cvt[46] }, &Hook_OMSetRT);     // OMSetRenderTargets
-        g_hk_drawidx = std::make_unique<FunctionHook>(Address{ cvt[13] }, &Hook_DrawIdx);     // DrawIndexedInstanced
-        if (!g_hk_omsetrt->create()) { g_hk_omsetrt.reset(); spdlog::warn("[FH5UIR] OMSetRenderTargets hook FAILED"); }
-        if (!g_hk_drawidx->create()) { g_hk_drawidx.reset(); spdlog::warn("[FH5UIR] DrawIndexedInstanced hook FAILED"); }
+        g_hk_omsetrt  = std::make_unique<FunctionHook>(Address{ cvt[46] }, &Hook_OMSetRT);   // OMSetRenderTargets
+        g_hk_drawinst = std::make_unique<FunctionHook>(Address{ cvt[12] }, &Hook_DrawInst);  // DrawInstanced
+        g_hk_drawidx  = std::make_unique<FunctionHook>(Address{ cvt[13] }, &Hook_DrawIdx);   // DrawIndexedInstanced
+        g_hk_setpso   = std::make_unique<FunctionHook>(Address{ cvt[25] }, &Hook_SetPSO);    // SetPipelineState
+        if (!g_hk_omsetrt->create())  { g_hk_omsetrt.reset();  spdlog::warn("[FH5UIR] OMSetRenderTargets hook FAILED"); }
+        if (!g_hk_drawinst->create()) { g_hk_drawinst.reset(); spdlog::warn("[FH5UIR] DrawInstanced hook FAILED"); }
+        if (!g_hk_drawidx->create())  { g_hk_drawidx.reset();  spdlog::warn("[FH5UIR] DrawIndexedInstanced hook FAILED"); }
+        if (!g_hk_setpso->create())   { g_hk_setpso.reset();   spdlog::warn("[FH5UIR] SetPipelineState hook FAILED"); }
     }
     if (cl) cl->Release();
     if (alloc) alloc->Release();
 
-    g_uir_rt_valid.store(g_hk_omsetrt != nullptr && g_hk_drawidx != nullptr, std::memory_order_release);
-    spdlog::info("[FH5UIR] installed: UI RT {}x{} bbRTVs={} omsetrt={} drawidx={}",
-                 w, h, g_uir_bb_rtvs.size(), g_hk_omsetrt ? 1 : 0, g_hk_drawidx ? 1 : 0);
+    g_uir_rt_valid.store(g_hk_omsetrt && g_hk_drawinst && g_hk_drawidx && g_hk_setpso, std::memory_order_release);
+    spdlog::info("[FH5UIR] installed: UI RT {}x{} bbRTVs={} hooks(omset/drawinst/drawidx/setpso)={}/{}/{}/{}",
+                 w, h, g_uir_bb_rtvs.size(), g_hk_omsetrt ? 1 : 0, g_hk_drawinst ? 1 : 0,
+                 g_hk_drawidx ? 1 : 0, g_hk_setpso ? 1 : 0);
 }
 
 void ui_redirect_on_present() {
     static uint64_t s_last_log = 0;
     static uint64_t s_last_redirects = 0;
-    g_uir_cleared.store(false, std::memory_order_relaxed);   // re-clear the UI RT next frame
+    g_uir_cleared.store(false, std::memory_order_relaxed);          // re-clear the UI RT next frame
+    g_uir_after_composite.store(false, std::memory_order_relaxed);  // reset the frame phase
     const uint64_t now = GetTickCount64();
-    const uint32_t bbdraws = g_uir_bbdraw_count.exchange(0, std::memory_order_relaxed);
-    const uint32_t maxidx = g_uir_bbdraw_maxidx.exchange(0, std::memory_order_relaxed);
     if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && now - s_last_log >= 1000) {
         s_last_log = now;
         const uint64_t tot = g_uir_redirects.load(std::memory_order_relaxed);
-        spdlog::info("[FH5UIR] frame: bbDraws={} maxIdx={} redirected~{}/frame (total {})",
-                     bbdraws, maxidx, tot - s_last_redirects, tot);
+        // De-risk: if compositePSO=0 the world-composite PS hash was never classified -> FH5 likely creates
+        // PSOs via ID3D12Device2::CreatePipelineState or a pipeline library (vt10 alone misses them).
+        spdlog::info("[FH5UIR] frame: bbDraws={} compositeDraws={} uiDraws={} redirected~{}/frame (total {}) | gfxPSOs={} compositePSO={}",
+                     g_dbg_bb_draws.exchange(0, std::memory_order_relaxed),
+                     g_dbg_composite_draws.exchange(0, std::memory_order_relaxed),
+                     g_dbg_ui_draws.exchange(0, std::memory_order_relaxed),
+                     tot - s_last_redirects, tot,
+                     g_pso_create_count.load(std::memory_order_relaxed),
+                     g_composite_pso_count.load(std::memory_order_relaxed));
         s_last_redirects = tot;
     }
 }
