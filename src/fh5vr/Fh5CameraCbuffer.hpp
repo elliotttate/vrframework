@@ -22,6 +22,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi.h>
 
 namespace fh5cb {
 
@@ -39,6 +40,15 @@ void ensure_installed(ID3D12Device* device);
 // own VIEW-SPACE axes: x = right, y = up, z = forward. This is the per-eye IPD (lateral) plus optional
 // 6-DOF head translation. `active` gates whether we transform at all (false = pass cbuffers through).
 void set_eye_offset(float view_x, float view_y, float view_z, bool active);
+
+// --- UI-draw redirect (Case B: FH5 draws the HUD/menus DIRECTLY into the backbuffer, after a fullscreen
+// world composite; see _agent_reports/fh5_hud_quad_re_plan). Hooks the command-list OMSetRenderTargets to
+// send the UI draws to a separate transparent RT instead of the backbuffer, leaving the backbuffer = clean
+// world. Gated by ctl_ui_redirect(). Install once (device + swapchain known); reset per present. -------
+void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain);
+void ui_redirect_on_present();          // reset the per-frame backbuffer-bind counter (once per present)
+ID3D12Resource* ui_redirect_target();   // UI-only RT (alpha) for the quad this frame; nullptr if inactive
+bool ui_redirect_active();              // redirect on + installed + UI RT valid
 
 // Diagnostics for the FH5VR.log heartbeat.
 unsigned long long ring_writes();
@@ -78,6 +88,7 @@ float ctl_hud_w();      // quad width (metres); height from texture aspect
 float ctl_hud_x();      // quad centre offset in view space (metres): +x right
 float ctl_hud_y();      // +y up
 float ctl_hud_z();      // -z forward (distance in front of the head)
+bool  ctl_ui_redirect();// uiredirect=on -> redirect FH5's backbuffer UI draws to a separate RT (Case B)
 
 // UPSTREAM camera-translation test (constant camera-relative offset applied in the producer hook to find
 // which argument is the real camera-position lever, with shadows/derived data following). tgt: 0=off,

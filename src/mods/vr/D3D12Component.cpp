@@ -152,6 +152,9 @@ bool D3D12Component::on_frame(VR* vr) {
         return false;
     }
 
+    // Install the UI-draw redirect once device+swapchain are live (idempotent; gated by uiredirect at runtime).
+    fh5cb::ui_redirect_install(device, swapchain);
+
     // Get the finished eye image (the engine just rendered this AFR frame's eye into it).
     ComPtr<ID3D12Resource> backbuffer{};
     const auto backbuffer_index = swapchain->GetCurrentBackBufferIndex();
@@ -240,7 +243,16 @@ bool D3D12Component::on_frame(VR* vr) {
         // outlive the end_frame call below, so it is declared here in the submit scope.
         std::vector<XrCompositionLayerBaseHeader*> extra_layers{};
         XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        if (fh5cb::ctl_hud_quad() && m_openxr.copy_hud(vr, eye_texture, device, command_queue)) {
+        // Quad source: the UI-only redirect RT (RENDER_TARGET) when ui-redirect is active and has captured UI
+        // this frame; otherwise the engine backbuffer (PRESENT) as the validation placeholder.
+        ID3D12Resource* hud_src = eye_texture;
+        D3D12_RESOURCE_STATES hud_src_state = D3D12_RESOURCE_STATE_PRESENT;
+        if (fh5cb::ui_redirect_active()) {
+            if (ID3D12Resource* uirt = fh5cb::ui_redirect_target()) {
+                hud_src = uirt; hud_src_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            }
+        }
+        if (fh5cb::ctl_hud_quad() && m_openxr.copy_hud(vr, hud_src, device, command_queue, hud_src_state)) {
             const float aspect = (m_openxr.hud_height > 0)
                 ? (float)m_openxr.hud_width / (float)m_openxr.hud_height : (16.0f / 9.0f);
             const float quad_w = fh5cb::ctl_hud_w();        // metres wide (live-tunable)
@@ -286,7 +298,8 @@ bool D3D12Component::on_frame(VR* vr) {
 }
 
 void D3D12Component::on_post_present(VR* vr) {
-    // Nothing required for the OpenXR path (kept for parity with REFramework's surface).
+    // Reset the UI-redirect per-frame backbuffer-bind counter once per present (frame boundary).
+    fh5cb::ui_redirect_on_present();
 }
 
 void D3D12Component::on_reset(VR* vr) {
@@ -641,7 +654,8 @@ void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource
     ctx.num_textures_acquired--;
 }
 
-bool D3D12Component::OpenXR::copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue) {
+bool D3D12Component::OpenXR::copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue,
+                                     D3D12_RESOURCE_STATES src_state) {
     std::scoped_lock _{this->mtx};
 
     auto& openxr = vr->m_openxr;
@@ -670,9 +684,9 @@ bool D3D12Component::OpenXR::copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device*
 
     auto& copier = this->hud_ctx.copiers[texture_index];
     copier->wait(INFINITE);
-    // src is the engine backbuffer (PRESENT) for the initial path-validation; later this is the UI texture.
+    // src is the engine backbuffer (PRESENT) during validation, or the UI-redirect RT (RENDER_TARGET).
     copier->copy(src, this->hud_ctx.textures[texture_index].texture,
-                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                 src_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     copier->execute(queue);
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};

@@ -96,9 +96,10 @@ private:
         // create_swapchains, populated + submitted in on_frame when fh5cb::ctl_hud_quad() is on.
         std::optional<std::string> create_hud_swapchain(VR* vr, ID3D12Device* device,
                                                         uint32_t width, uint32_t height, DXGI_FORMAT xr_fmt);
-        // Acquire/wait/copy/release the HUD swapchain image from `src`. Returns true if an image was released
-        // (so the caller may reference hud_handle in a quad layer this frame).
-        bool copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue);
+        // Acquire/wait/copy/release the HUD swapchain image from `src` (in state `src_state`). Returns true
+        // if an image was released (so the caller may reference hud_handle in a quad layer this frame).
+        bool copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue,
+                      D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT);
 
         XrSwapchain hud_handle{XR_NULL_HANDLE};
         int32_t hud_width{0};

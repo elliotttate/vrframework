@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fh5cb {
@@ -56,6 +57,7 @@ std::atomic<float> g_ctl_hud_w{ 1.6f };      // quad width in metres (height der
 std::atomic<float> g_ctl_hud_x{ 0.0f };      // quad centre offset (metres) in view space: +x right
 std::atomic<float> g_ctl_hud_y{ 0.0f };      // +y up
 std::atomic<float> g_ctl_hud_z{ -1.8f };     // -z forward (distance in front of the head)
+std::atomic<bool>  g_ctl_ui_redirect{ false }; // uiredirect=on -> redirect FH5's backbuffer UI draws to a separate RT (Case B)
 
 // UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
 // argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
@@ -109,6 +111,10 @@ void poll_control_file() {
                 strncmp(line + 10, "1", 1) == 0 ||
                 strncmp(line + 10, "true", 4) == 0;
             g_ctl_hud_opaque.store(enabled, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "uiredirect=", 11) == 0) {
+            const bool en = strncmp(line+11,"on",2)==0 || strncmp(line+11,"1",1)==0 || strncmp(line+11,"true",4)==0;
+            g_ctl_ui_redirect.store(en, std::memory_order_relaxed);
         }
         else if (sscanf_s(line, "hudw=%f", &v) == 1)    g_ctl_hud_w.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "hudx=%f", &v) == 1)    g_ctl_hud_x.store(v, std::memory_order_relaxed);
@@ -399,6 +405,40 @@ void STDMETHODCALLTYPE Hook_CBV(ID3D12Device* self, const D3D12_CONSTANT_BUFFER_
 // in a moving upload-ring slot allocated FRESH each frame, so the engine creates a fresh 6912B CBV for it
 // every frame -> Hook_CBV resolves the exact LIVE slot (no scan, no dangling) and transforms it in place.
 
+// ---------------------------------------------------------------------------
+// UI-draw redirect (Case B): track RTV->resource so we can tell when a command list binds the backbuffer.
+// CreateRenderTargetView is hooked EARLY (with the other device hooks) so the game's backbuffer RTVs —
+// created at swapchain setup, before ui_redirect_install — are captured. Map updated; backbuffer handles
+// are resolved in ui_redirect_install once the swapchain is known.
+// ---------------------------------------------------------------------------
+using FnRTV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+std::unique_ptr<FunctionHook> g_hk_rtv;
+std::mutex g_rtv_mtx;
+std::unordered_map<size_t, ID3D12Resource*> g_rtv_map;          // rtvHandle.ptr -> resource (raw; compare-only)
+std::unordered_set<size_t> g_uir_bb_rtvs;                       // subset whose resource is a swapchain backbuffer
+std::vector<ID3D12Resource*> g_uir_bb_resources;               // swapchain backbuffer ptrs (identity; set in install)
+
+// Helpers split out so the SEH (__try) hook bodies contain no C++ unwinding objects (MSVC C2712).
+void RecordRtv(size_t handle, ID3D12Resource* res) {
+    std::scoped_lock lk(g_rtv_mtx);
+    g_rtv_map[handle] = res;                   // store ptr identity only (never dereferenced)
+    for (auto* b : g_uir_bb_resources)         // tag backbuffer RTVs created after install too
+        if (b == res) { g_uir_bb_rtvs.insert(handle); break; }
+}
+bool IsBackbufferRtv(size_t handle) {
+    std::scoped_lock lk(g_rtv_mtx);
+    return g_uir_bb_rtvs.count(handle) != 0;
+}
+
+void STDMETHODCALLTYPE Hook_RTV(ID3D12Device* self, ID3D12Resource* res,
+    const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    auto orig = g_hk_rtv->get_original<FnRTV>();
+    orig(self, res, desc, handle);
+    __try {
+        RecordRtv((size_t)handle.ptr, res);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 std::atomic<bool> g_dev_done{ false };
 
 // Install the device buffer-tracking hooks (committed/placed/cbv). Called as early as possible — from the
@@ -410,9 +450,10 @@ void install_device_hooks(ID3D12Device* device) {
     g_hk_committed = std::make_unique<FunctionHook>(Address{ vt[27] }, &Hook_Committed);
     g_hk_placed    = std::make_unique<FunctionHook>(Address{ vt[29] }, &Hook_Placed);
     g_hk_cbv       = std::make_unique<FunctionHook>(Address{ vt[17] }, &Hook_CBV);
-    const bool ok = g_hk_committed->create() && g_hk_placed->create() && g_hk_cbv->create();
-    spdlog::info("[FH5CB] device buffer-tracking hooks {} (committed=vt27 placed=vt29 cbv=vt17)", ok ? "installed" : "FAILED");
-    if (!ok) { g_hk_committed.reset(); g_hk_placed.reset(); g_hk_cbv.reset(); g_dev_done.store(false); }
+    g_hk_rtv       = std::make_unique<FunctionHook>(Address{ vt[20] }, &Hook_RTV);  // CreateRenderTargetView
+    const bool ok = g_hk_committed->create() && g_hk_placed->create() && g_hk_cbv->create() && g_hk_rtv->create();
+    spdlog::info("[FH5CB] device buffer-tracking hooks {} (committed=vt27 placed=vt29 cbv=vt17 rtv=vt20)", ok ? "installed" : "FAILED");
+    if (!ok) { g_hk_committed.reset(); g_hk_placed.reset(); g_hk_cbv.reset(); g_hk_rtv.reset(); g_dev_done.store(false); }
 }
 
 // D3D12CreateDevice detour — catches the game device at creation (before the camera ring is allocated) and
@@ -431,6 +472,48 @@ HRESULT WINAPI Hook_CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID
         }
     }
     return hr;
+}
+
+// ---- UI-draw redirect: OMSetRenderTargets hook + UI render target ----------------------------------
+using FnOMSetRT = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+std::unique_ptr<FunctionHook> g_hk_omsetrt;
+std::atomic<bool> g_uir_installed{ false };
+ID3D12Resource*       g_uir_ui_rt = nullptr;      // UI-only RT (alpha); process-lifetime singleton
+ID3D12DescriptorHeap* g_uir_rtv_heap = nullptr;
+D3D12_CPU_DESCRIPTOR_HANDLE g_uir_ui_rtv{};
+std::atomic<bool>     g_uir_rt_valid{ false };
+std::atomic<int>      g_uir_bb_binds{ 0 };        // backbuffer binds seen this frame (record order)
+std::atomic<bool>     g_uir_cleared{ false };     // UI RT cleared this frame
+std::atomic<uint64_t> g_uir_redirects{ 0 };       // total UI binds redirected (diagnostic)
+
+void STDMETHODCALLTYPE Hook_OMSetRT(ID3D12GraphicsCommandList* self, UINT num,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
+    auto orig = g_hk_omsetrt->get_original<FnOMSetRT>();
+    D3D12_CPU_DESCRIPTOR_HANDLE local[8];
+    const D3D12_CPU_DESCRIPTOR_HANDLE* useRts = rts;
+    UINT useNum = num; BOOL useSingle = single;
+    __try {
+        if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && g_uir_rt_valid.load(std::memory_order_relaxed)
+            && num >= 1 && rts) {
+            const bool isBB = IsBackbufferRtv((size_t)rts[0].ptr);
+            if (isBB) {
+                const int n = g_uir_bb_binds.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n >= 2) {   // past the fullscreen world composite (1st backbuffer bind) -> UI -> redirect
+                    if (!g_uir_cleared.exchange(true, std::memory_order_relaxed)) {
+                        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                        self->ClearRenderTargetView(g_uir_ui_rtv, zero, 0, nullptr);
+                    }
+                    const UINT cnt = (single || num > 8) ? 1u : num;   // single-range/overflow -> bind only our RT
+                    for (UINT i = 0; i < cnt; ++i) local[i] = (i < num) ? rts[i] : rts[0];
+                    local[0] = g_uir_ui_rtv;                            // replace the backbuffer with the UI RT
+                    useRts = local; useNum = cnt; useSingle = FALSE;
+                    g_uir_redirects.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { useRts = rts; useNum = num; useSingle = single; }
+    orig(self, useNum, useRts, useSingle, dsv);
 }
 
 } // namespace
@@ -453,6 +536,81 @@ void ensure_installed(ID3D12Device* device) {
     // The transform happens in Hook_CBV (no command-queue hook needed).
     install_device_hooks(device);
 }
+
+void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain) {
+    if (!device || !swapchain || g_uir_installed.exchange(true)) return;
+
+    // Resolve which already-recorded RTV handles point to swapchain backbuffers (the game creates these at
+    // swapchain setup; the early CreateRenderTargetView hook captured them into g_rtv_map).
+    DXGI_SWAP_CHAIN_DESC scd{};
+    if (FAILED(swapchain->GetDesc(&scd))) { g_uir_installed.store(false); return; }
+    std::vector<ID3D12Resource*> bbs;
+    for (UINT i = 0; i < scd.BufferCount && i < 8; ++i) {
+        ID3D12Resource* b = nullptr;
+        if (SUCCEEDED(swapchain->GetBuffer(i, IID_PPV_ARGS(&b))) && b) { bbs.push_back(b); b->Release(); } // identity only
+    }
+    {
+        std::scoped_lock lk(g_rtv_mtx);
+        g_uir_bb_resources = bbs;            // remember backbuffer ptrs so Hook_RTV tags future RTVs too
+        g_uir_bb_rtvs.clear();
+        for (auto& kv : g_rtv_map)
+            for (auto* b : bbs) if (kv.second == b) { g_uir_bb_rtvs.insert(kv.first); break; }
+    }
+
+    // Create the UI-only render target (backbuffer-sized RGBA8) + its RTV.
+    const UINT w = scd.BufferDesc.Width  ? scd.BufferDesc.Width  : 1152;
+    const UINT h = scd.BufferDesc.Height ? scd.BufferDesc.Height : 864;
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{}; cv.Format = rd.Format;   // transparent black
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&g_uir_ui_rt))) || !g_uir_ui_rt) {
+        spdlog::warn("[FH5UIR] UI RT create failed"); return;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_uir_rtv_heap))) || !g_uir_rtv_heap) {
+        spdlog::warn("[FH5UIR] RTV heap create failed"); return;
+    }
+    g_uir_ui_rtv = g_uir_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(g_uir_ui_rt, nullptr, g_uir_ui_rtv);
+
+    // Hook OMSetRenderTargets (ID3D12GraphicsCommandList vtable index 46) via a throwaway list's vtable
+    // (shared across all lists from this device, so this catches FH5's UI-recording list too).
+    ID3D12CommandAllocator* alloc = nullptr; ID3D12GraphicsCommandList* cl = nullptr;
+    if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) && alloc &&
+        SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl))) && cl) {
+        void** cvt = *reinterpret_cast<void***>(cl);
+        g_hk_omsetrt = std::make_unique<FunctionHook>(Address{ cvt[46] }, &Hook_OMSetRT);
+        if (!g_hk_omsetrt->create()) { g_hk_omsetrt.reset(); spdlog::warn("[FH5UIR] OMSetRenderTargets hook FAILED"); }
+    }
+    if (cl) cl->Release();
+    if (alloc) alloc->Release();
+
+    g_uir_rt_valid.store(g_hk_omsetrt != nullptr, std::memory_order_release);
+    spdlog::info("[FH5UIR] installed: UI RT {}x{} bbRTVs={} omsetrt={}", w, h, g_uir_bb_rtvs.size(), g_hk_omsetrt ? 1 : 0);
+}
+
+void ui_redirect_on_present() {
+    static uint64_t s_last_log = 0;
+    const int binds = g_uir_bb_binds.exchange(0, std::memory_order_relaxed);
+    g_uir_cleared.store(false, std::memory_order_relaxed);
+    const uint64_t now = GetTickCount64();
+    if (g_ctl_ui_redirect.load(std::memory_order_relaxed) && now - s_last_log >= 1000) {
+        s_last_log = now;
+        spdlog::info("[FH5UIR] frame: backbuffer binds={} (1=composite, rest redirected) totalRedirects={}",
+                     binds, g_uir_redirects.load(std::memory_order_relaxed));
+    }
+}
+
+ID3D12Resource* ui_redirect_target() {
+    return (g_ctl_ui_redirect.load(std::memory_order_relaxed) && g_uir_rt_valid.load(std::memory_order_relaxed)
+            && g_uir_redirects.load(std::memory_order_relaxed) > 0) ? g_uir_ui_rt : nullptr;
+}
+
+bool ui_redirect_active() { return ui_redirect_target() != nullptr; }
 
 void set_eye_offset(float view_x, float view_y, float view_z, bool active) {
     g_off_x.store(view_x, std::memory_order_relaxed);
@@ -485,6 +643,7 @@ float ctl_hud_w()       { return g_ctl_hud_w.load(std::memory_order_relaxed); }
 float ctl_hud_x()       { return g_ctl_hud_x.load(std::memory_order_relaxed); }
 float ctl_hud_y()       { return g_ctl_hud_y.load(std::memory_order_relaxed); }
 float ctl_hud_z()       { return g_ctl_hud_z.load(std::memory_order_relaxed); }
+bool  ctl_ui_redirect() { return g_ctl_ui_redirect.load(std::memory_order_relaxed); }
 const char* pos_lane_name(int lane) {
     switch (lane) {
     case kPosLaneCcam320: return "ccam320";
