@@ -2625,6 +2625,80 @@ DWORD WINAPI WorkerThread(void*) {
 // HW data-bp (that crashes FH5). Our front VEH (AddVectoredExceptionHandler First=1) CONSUMES the guard
 // fault (EXCEPTION_CONTINUE_EXECUTION) so NVIDIA's overlay VEH never sees it. Gated to rot=driver; logs the
 // distinct writer RVAs to FH5VR.log ([FH5PGTRACE]). Hand the RVA to RE to decompile.
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC first-chance exception logger. Registered FIRST. CRITICAL SAFETY: it ONLY inspects faults whose
+// faulting RIP lies inside OUR OWN module (FH5VR.dll). For ALL other faults -- especially the Empress de-DRM's
+// (EMP.dll+0x21A1C reads 0x76350000 in a tight exception-VM loop, sometimes storming hundreds/ms) -- it returns
+// EXCEPTION_CONTINUE_SEARCH IMMEDIATELY after a cheap range check, doing NO logging/module-lookup. That is the
+// whole point: a VEH that does heavy work on the de-DRM's exceptions is exactly what amplifies the storm into a
+// crash (the documented failure mode). So we observe only OUR hook faults (the actionable ones) and never touch
+// the de-DRM/driver/overlay exceptions. No thread_local (faults on pre-existing threads); depth-capped.
+PVOID g_diag_veh = nullptr;
+std::atomic<uint64_t> g_diag_veh_count{ 0 };
+std::atomic<int>      g_diag_veh_depth{ 0 };
+std::atomic<uint64_t> g_diag_veh_last_ms{ 0 };
+uintptr_t             g_self_base = 0, g_self_end = 0;   // FH5VR.dll image range (set in InstallDiagVeh)
+
+LONG CALLBACK DiagVeh(EXCEPTION_POINTERS* ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Only hard memory faults; ignore C++ EH (0xE06D7363), guard-page (PgVeh owns it), DBG/control codes, etc.
+    if (code != 0xC0000005u /*AV*/ && code != 0xC0000006u /*in-page*/ && code != 0xC00000FDu /*stack overflow*/)
+        return EXCEPTION_CONTINUE_SEARCH;
+    // SELF-ONLY GATE (cheap, FIRST): ignore every fault whose RIP is outside FH5VR.dll. The de-DRM faults
+    // constantly as normal operation -- doing ANY work on those (esp. during a storm) destabilises it. Bail now.
+    const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    if (!g_self_base || rip < g_self_base || rip >= g_self_end) return EXCEPTION_CONTINUE_SEARCH;
+    if (g_diag_veh_depth.fetch_add(1, std::memory_order_relaxed) >= 16) {   // runaway backstop (no thread_local)
+        g_diag_veh_depth.fetch_sub(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uint64_t n = g_diag_veh_count.fetch_add(1, std::memory_order_relaxed);
+    bool do_log = n < 80;                                                   // always log the first 80...
+    if (!do_log) {                                                         // ...then at most ~1/sec
+        const uint64_t now = ::GetTickCount64();
+        uint64_t last = g_diag_veh_last_ms.load(std::memory_order_relaxed);
+        if (now - last >= 1000 && g_diag_veh_last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            do_log = true;
+    }
+    if (do_log) {
+        const ULONG np = ep->ExceptionRecord->NumberParameters;
+        const int       rw = np >= 1 ? (int)ep->ExceptionRecord->ExceptionInformation[0] : -1;
+        const uintptr_t fa = np >= 2 ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        char modname[64] = "?"; uintptr_t rva = 0;
+        HMODULE mod = nullptr;
+        if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 (LPCSTR)rip, &mod) && mod) {
+            char full[MAX_PATH] = {0};
+            if (::GetModuleFileNameA(mod, full, MAX_PATH)) {
+                const char* b = strrchr(full, '\\');
+                strncpy_s(modname, sizeof(modname), b ? b + 1 : full, _TRUNCATE);
+            }
+            rva = rip - (uintptr_t)mod;
+        }
+        spdlog::warn("[FH5VEH] first-chance code=0x{:X} rip=0x{:X} mod={}+0x{:X} access={} faultAddr=0x{:X} n={}",
+                     (uint32_t)code, rip, modname, rva,
+                     rw == 0 ? "READ" : (rw == 1 ? "WRITE" : (rw == 8 ? "EXEC" : "?")), fa, n);
+    }
+    g_diag_veh_depth.fetch_sub(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_SEARCH;                                       // pure observer -> behavior unchanged
+}
+
+void InstallDiagVeh() {
+    if (g_diag_veh) return;
+    // Resolve OUR module's image range so DiagVeh can cheaply ignore all non-FH5VR.dll faults (esp. the de-DRM's).
+    HMODULE self = nullptr;
+    if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (LPCSTR)&InstallDiagVeh, &self) && self) {
+        g_self_base = (uintptr_t)self;
+        auto* dos = (IMAGE_DOS_HEADER*)self;
+        auto* nt  = (IMAGE_NT_HEADERS*)(g_self_base + dos->e_lfanew);
+        g_self_end = g_self_base + nt->OptionalHeader.SizeOfImage;
+    }
+    g_diag_veh = AddVectoredExceptionHandler(1, &DiagVeh);   // FIRST, but self-only -> never touches de-DRM faults
+    spdlog::info("[FH5VEH] diagnostic logger installed self=0x{:X}..0x{:X} ({})",
+                 g_self_base, g_self_end, g_diag_veh ? "ok" : "FAILED");
+}
+
 PVOID g_pg_veh = nullptr;
 std::atomic<uintptr_t> g_pg_page{ 0 };      // guarded page base (0 = disarmed/consumed)
 std::atomic<int> g_pg_kind{ -1 };           // -1 none, 0 read, 1 write, 8 exec
@@ -2696,6 +2770,7 @@ DWORD WINAPI PgTracerThread(void*) {
 // ---------------------------------------------------------------------------
 void start() {
     if (g_started.exchange(true)) return;   // idempotent: launch the worker exactly once
+    InstallDiagVeh();   // FIRST: log every first-chance fault (incl. our hooks' stale-ptr AVs during loading)
     // PAGE_GUARD tracer for the rendered camera's +0x90 writer (gated to rot=driver inside the thread).
     if (HANDLE pg = CreateThread(nullptr, 0, &PgTracerThread, nullptr, 0, nullptr)) { CloseHandle(pg); }
     if (HANDLE t = CreateThread(nullptr, 0, &WorkerThread, nullptr, 0, nullptr)) {

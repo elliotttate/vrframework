@@ -29,6 +29,8 @@ class VR;
 
 namespace vrmod {
 
+struct HudBlitter;
+
 // Minimal barrier->copy->barrier helper with its own allocator/list/fence, one per
 // in-flight slot. Equivalent in spirit to REFramework's d3d12::ResourceCopier; the
 // barrier discipline matches guide 10 §3 (restore source/dest states after the copy).
@@ -72,11 +74,15 @@ private:
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     struct OpenXR {
+        OpenXR();
+        ~OpenXR();
+
         std::optional<std::string> create_swapchains(VR* vr);
         void destroy_swapchains(VR* vr);
         // Acquire/wait/copy/release the swapchain image for eye `swapchain_idx`.
         void copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource* src,
-                  ID3D12Device* device, ID3D12CommandQueue* queue, int x_shift = 0);
+                  ID3D12Device* device, ID3D12CommandQueue* queue, int x_shift = 0,
+                  D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT);
         void wait_for_all_copies();
 
         struct SwapchainContext {
@@ -90,8 +96,9 @@ private:
         std::array<uint32_t, 2> last_resolution{};
 
         // --- UI/HUD quad layer (separate from the eye swapchains) -------------------------------------
-        // A single swapchain whose image is submitted each frame as a head-locked XrCompositionLayerQuad in
-        // view_space, so the flat UI/menus float on a panel instead of being stereo-warped into both eyes.
+        // A single swapchain whose image is submitted each frame as a fixed LOCAL-space
+        // XrCompositionLayerQuad, so the flat UI/menus float on a stable panel instead of
+        // being stereo-warped into both eyes or following the HMD.
         // Kept OUT of openxr->swapchains (that vector is the projection-layer eye set). Created in
         // create_swapchains, populated + submitted in on_frame when fh5cb::ctl_hud_quad() is on.
         std::optional<std::string> create_hud_swapchain(VR* vr, ID3D12Device* device,
@@ -99,13 +106,25 @@ private:
         // Acquire/wait/copy/release the HUD swapchain image from `src` (in state `src_state`). Returns true
         // if an image was released (so the caller may reference hud_handle in a quad layer this frame).
         bool copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device* device, ID3D12CommandQueue* queue,
-                      D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT);
+                      D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT,
+                      D3D12_CPU_DESCRIPTOR_HANDLE src_srv = D3D12_CPU_DESCRIPTOR_HANDLE{});
+        bool copy_hud_delta(VR* vr, ID3D12Resource* final_src, ID3D12Resource* base_src,
+                            ID3D12Device* device, ID3D12CommandQueue* queue,
+                            D3D12_RESOURCE_STATES final_state = D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATES base_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+        std::unique_ptr<HudBlitter> hud_blitter{};
         XrSwapchain hud_handle{XR_NULL_HANDLE};
         int32_t hud_width{0};
         int32_t hud_height{0};
         SwapchainContext hud_ctx{};
         bool hud_ready{false};
+        bool hud_layer_ready{false};
+        int hud_layer_phase{-1};
+        bool hud_anchor_ready{false};
+        int hud_anchor_recenter_seq{-1};
+        XrVector3f hud_anchor_origin{0.0f, 0.0f, 0.0f};
+        XrQuaternionf hud_anchor_orientation{0.0f, 0.0f, 0.0f, 1.0f};
     } m_openxr;
 
     std::array<ResourceCopier, 3> m_generic_copiers{}; // desktop-mirror / scratch copies

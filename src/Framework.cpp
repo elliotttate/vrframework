@@ -85,9 +85,23 @@ Framework::Framework(HMODULE framework_module) {
     // detours it; the real game presents then drive the frame-init state machine (initialize() ->
     // first_frame_initialize() -> mods init -> Fh5Adapter::install_hooks() + OpenXR). Without this the
     // log stalls at "vrframework entry" forever. d3d12.dll is already resident (dllmain waited for it).
-    spdlog::info("hooking D3D12 from ctor");
-    if (!hook_d3d12()) {
-        spdlog::error("hook_d3d12() failed in ctor");
+    // CAPTURE-COMPAT MODE (FH5VR_NO_OPENXR=1): skip the framework's D3D12 present hook entirely. That hook
+    // spins up a throwaway device+swapchain and SCANS it for the command-queue offset -- which ACCESS-VIOLATES
+    // on a RenderDoc/PIX-WRAPPED swapchain (the wrapper's internals point into foreign memory; an AV is not a
+    // C++ exception so the try/catch can't save it -- same failure class as the RTTI probe we already skip).
+    // With the hook skipped, the dxgi proxy just passes Present through -> FH5 renders FLAT/normally and a
+    // RenderDoc launch-time capture works. The mod is otherwise inert (no VR, no stereo). Used to capture the
+    // game's native render path under RenderDoc without the wrapper conflict.
+    {
+        char buf[8]{};
+        if (GetEnvironmentVariableA("FH5VR_NO_OPENXR", buf, sizeof(buf)) > 0 && buf[0] == '1') {
+            spdlog::warn("hooking D3D12 SKIPPED: FH5VR_NO_OPENXR=1 (capture-compat; flat render, mod inert, RenderDoc-safe)");
+        } else {
+            spdlog::info("hooking D3D12 from ctor");
+            if (!hook_d3d12()) {
+                spdlog::error("hook_d3d12() failed in ctor");
+            }
+        }
     }
 }
 

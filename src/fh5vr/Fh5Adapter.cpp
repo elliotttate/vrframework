@@ -646,6 +646,110 @@ static void* __fastcall Hook_FollowCamAngles(void* a1, void* a2, void* a3, void*
     return r;
 }
 
+// UIRenderer (D3D12UIRenderer) per-frame RENDER ENTRY = vtable slot 54 @ EA 0x14181FCB0 (RVA 0x181FCB0).
+// RE: analysis/rtti_map.json — UIRenderer vtable base 0x145F8F498 (RVA 0x5F8F498), slot 54 ptr at +0x1B0
+// (RVA 0x5F8F648); FH3 dev build confirms UIRenderer::GetRenderTarget (the class owns its RT, == vf54's
+// *(this+64)). Hooking vf54 brackets the WHOLE AVUI pass: while it executes, the engine records the
+// HUD/menu draws on this thread, so Fh5CameraCbuffer's command-list draw hooks redirect every backbuffer
+// draw made during the bracket to the UI RT for the OpenXR quad (scene-independent — covers HUD AND menus,
+// unlike the composite-PSO heuristic). Body is trivial (enter/leave bracket + a counter) -> no faulting
+// deref -> AV-safe (won't trip the NVIDIA overlay VEH, see [[fh5-nvidia-veh-crash]]). The redirect itself is
+// still gated by uiredirect=on, so this hook is a no-op for the rendered image when the redirect is off.
+using UIRendererRenderFn = void(__fastcall*)(void*, void*, void*);
+static std::unique_ptr<FunctionHook> g_uir_render_hook;
+static std::atomic<uint64_t> g_uir_render_calls{ 0 };
+static void __fastcall Hook_UIRendererRender(void* a1, void* a2, void* a3) {
+    fh5cb::enter_ui_pass();
+    const uint64_t n = g_uir_render_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_uir_render_hook->get_original<UIRendererRenderFn>()(a1, a2, a3);
+    fh5cb::leave_ui_pass();
+    {   // Heartbeat + optional RT probe. The probe (probe_ui_renderer_rt) does SEH-guarded memory scans that
+        // generate FIRST-CHANCE AVs near the Empress de-DRM -> can trip the NVIDIA overlay VEH ([[fh5-nvidia-veh-crash]]),
+        // and uiredirect=30 does NOT need it (it uses the bracket, not the probed RT). So gate the probe behind
+        // FH5VR_UI_RT_PROBE=1; keep the lightweight heartbeat always.
+        static uint64_t s_last = 0;
+        static const bool probe_enabled = ::GetEnvironmentVariableA("FH5VR_UI_RT_PROBE", nullptr, 0) > 0;
+        const uint64_t now = ::GetTickCount64();
+        if (n <= 12 || now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5UIR] UIRenderer vf54 calls={} a1=0x{:X}", n, reinterpret_cast<uintptr_t>(a1));
+            if (probe_enabled) fh5cb::probe_ui_renderer_rt(a1);   // locate FH5's HUD RT -> [FH5UIRT]
+        }
+    }
+}
+
+using OverlayVf14Fn = void(__fastcall*)(void*, char);
+using OverlayVf17Fn = void(__fastcall*)(void*, void*);
+using OverlayVf19Fn = void(__fastcall*)(void*, void*);
+using OverlayVf24Fn = uint64_t(__fastcall*)(void*, uint32_t, float, float);
+using OverlayTextureBindFn = void(__fastcall*)(void*, void*, void*);
+using OverlayPsBindingVf1Fn = char(__fastcall*)(void*);
+using OverlayImmediateFlushFn = void(__fastcall*)(void*);
+using OverlayNativeTargetBindFn = void(__fastcall*)(void*, void*, char);
+
+static std::unique_ptr<FunctionHook> g_overlay_vf14_hook;
+static std::unique_ptr<FunctionHook> g_overlay_vf17_hook;
+static std::unique_ptr<FunctionHook> g_overlay_vf19_hook;
+static std::unique_ptr<FunctionHook> g_overlay_vf24_hook;
+static std::unique_ptr<FunctionHook> g_overlay_texbind_hook;
+static std::unique_ptr<FunctionHook> g_overlay_psbind_hook;
+static std::unique_ptr<FunctionHook> g_overlay_flush_hook;
+static std::unique_ptr<FunctionHook> g_overlay_target_bind_hook;
+
+static void __fastcall Hook_OverlayVf14(void* renderer, char surface_sized) {
+    fh5cb::record_overlay_viewport_setup(renderer, surface_sized != 0);
+    g_overlay_vf14_hook->get_original<OverlayVf14Fn>()(renderer, surface_sized);
+    fh5cb::record_overlay_viewport_setup(renderer, surface_sized != 0);
+}
+
+static void __fastcall Hook_OverlayVf17(void* renderer, void* item) {
+    fh5cb::enter_overlay_renderer12_draw(renderer, 0x17000000u);
+    g_overlay_vf17_hook->get_original<OverlayVf17Fn>()(renderer, item);
+    fh5cb::leave_overlay_renderer12_draw();
+}
+
+static void __fastcall Hook_OverlayVf19(void* renderer, void* item) {
+    fh5cb::enter_overlay_renderer12_draw(renderer, 0x19000000u);
+    g_overlay_vf19_hook->get_original<OverlayVf19Fn>()(renderer, item);
+    fh5cb::leave_overlay_renderer12_draw();
+}
+
+static uint64_t __fastcall Hook_OverlayVf24(void* renderer, uint32_t layer, float x, float y) {
+    fh5cb::enter_overlay_renderer12_draw(renderer, layer);
+    const uint64_t r = g_overlay_vf24_hook->get_original<OverlayVf24Fn>()(renderer, layer, x, y);
+    fh5cb::leave_overlay_renderer12_draw();
+    return r;
+}
+
+static void __fastcall Hook_OverlayTextureBind(void* renderer, void* texture_lock, void* render_context) {
+    g_overlay_texbind_hook->get_original<OverlayTextureBindFn>()(renderer, texture_lock, render_context);
+    fh5cb::record_overlay_texture_bind(renderer, texture_lock, render_context);
+}
+
+static char __fastcall Hook_OverlayPsBindingVf1(void* ps) {
+    const char r = g_overlay_psbind_hook->get_original<OverlayPsBindingVf1Fn>()(ps);
+    fh5cb::record_overlay_ps_binding(ps);
+    return r;
+}
+
+static void __fastcall Hook_OverlayImmediateFlush(void* state) {
+    fh5cb::enter_overlay_immediate_flush(state);
+    g_overlay_flush_hook->get_original<OverlayImmediateFlushFn>()(state);
+    fh5cb::leave_overlay_immediate_flush();
+}
+
+static void __fastcall Hook_OverlayNativeTargetBind(void* render_context, void* target_object, char bind_mode) {
+    g_overlay_target_bind_hook->get_original<OverlayNativeTargetBindFn>()(render_context, target_object, bind_mode);
+    fh5cb::record_overlay_native_target_bind(render_context, target_object, bind_mode != 0);
+}
+
+// SEH-guarded pointer read (verify a vtable slot before hooking; no C++ unwinding objects -> __try legal).
+static bool ReadPtrSEH(uintptr_t addr, uintptr_t& out) {
+    if (addr == 0) return false;
+    __try { out = *reinterpret_cast<const uintptr_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 bool Fh5Adapter::install_hooks() {
     // sub_140BB1EE0 prologue (Empress RVA 0xBB1EE0). Scan-or-fallback so a single binary serves the build.
     const uintptr_t addr = memory::FuncRelocation(
@@ -798,6 +902,120 @@ bool Fh5Adapter::install_hooks() {
         spdlog::warn("[FH5] follow-cam angle hook create failed @0x{:X}", followcam);
     } else {
         spdlog::info("[FH5] follow-cam angle hook installed @0x{:X} (sub_140DC9770)", followcam);
+    }
+
+    // UIRenderer (D3D12UIRenderer) render-entry vf54 — a diagnostic UI-pass bracket. This path can be called
+    // thousands of times during startup/menu rendering, so keep it opt-in while the stable HUD quad path uses
+    // the lower-level command-list/resource tracking instead.
+    {
+        // vf54 UI-pass bracket. REQUIRED for the engine-seam UI redirect (uiredirect=30 / "seam"): it marks the
+        // UIRenderer render pass so the command-list draw hooks know which draws are UI. enter/leave are trivial
+        // atomic counters (no faulting deref -> AV-safe). Installed BY DEFAULT now; set FH5VR_UI_RENDERER_HOOK=0
+        // to disable. The redirect itself is still gated by uiredirect, so this is a no-op image-wise when off.
+        char uirhk[8]{};
+        const bool disabled = ::GetEnvironmentVariableA("FH5VR_UI_RENDERER_HOOK", uirhk, sizeof(uirhk)) > 0 && uirhk[0] == '0';
+        if (!disabled) {
+            const uintptr_t base = memory::module_base();
+            const uintptr_t vtbl_slot54 = base + 0x5F8F648;   // &UIRenderer::vftable[54]
+            const uintptr_t expected    = base + 0x181FCB0;   // UIRenderer__vf54
+            uintptr_t slot = 0;
+            if (ReadPtrSEH(vtbl_slot54, slot) && slot == expected) {
+                g_uir_render_hook = std::make_unique<FunctionHook>(Address{ slot }, &Hook_UIRendererRender);
+                if (!g_uir_render_hook->create()) {
+                    g_uir_render_hook.reset();
+                    spdlog::warn("[FH5UIR] UIRenderer vf54 render-entry hook create FAILED @0x{:X}", slot);
+                } else {
+                    spdlog::info("[FH5UIR] UIRenderer vf54 render-entry hook installed @0x{:X} (vtable slot 54 verified; UI-pass bracket ON for uiredirect=30)", slot);
+                }
+            } else {
+                spdlog::warn("[FH5UIR] UIRenderer vf54 vtable mismatch (slot=0x{:X} expected=0x{:X}) — UI-pass bracket OFF; uiredirect=30 cannot catch UI", slot, expected);
+            }
+        } else {
+            spdlog::info("[FH5UIR] UIRenderer vf54 render-entry hook DISABLED (FH5VR_UI_RENDERER_HOOK=0)");
+        }
+    }
+
+    // OverlayRenderer12 exact UI source path. The resource-binding hook is the complete capture point because
+    // both sub_140E15C90 and the inline textured rectangle path update OverlayRendererPSParameters before this
+    // binding function resolves textureObject+0x10 to the SRV descriptor.
+    {
+        const uintptr_t base = memory::module_base();
+        const uintptr_t overlay_vtbl = base + 0x5EB1CF0; // vftbl_OverlayRenderer12
+        struct OverlaySlot { const char* name; uintptr_t slot_rva; uintptr_t fn_rva; std::unique_ptr<FunctionHook>* hook; void* detour; };
+        OverlaySlot slots[] = {
+            {"vf14", 14u * sizeof(uintptr_t), 0xDEE440, &g_overlay_vf14_hook, (void*)&Hook_OverlayVf14},
+            {"vf17", 17u * sizeof(uintptr_t), 0xE0C4D0, &g_overlay_vf17_hook, (void*)&Hook_OverlayVf17},
+            {"vf19", 19u * sizeof(uintptr_t), 0xE0B290, &g_overlay_vf19_hook, (void*)&Hook_OverlayVf19},
+            {"vf24", 24u * sizeof(uintptr_t), 0xE08D40, &g_overlay_vf24_hook, (void*)&Hook_OverlayVf24},
+        };
+        for (const auto& s : slots) {
+            uintptr_t slot = 0;
+            const uintptr_t expected = base + s.fn_rva;
+            if (ReadPtrSEH(overlay_vtbl + s.slot_rva, slot) && slot == expected) {
+                *s.hook = std::make_unique<FunctionHook>(Address{ slot }, reinterpret_cast<uintptr_t>(s.detour));
+                if (!(*s.hook)->create()) {
+                    s.hook->reset();
+                    spdlog::warn("[FH5OVERLAY] OverlayRenderer12 {} hook create FAILED @0x{:X}", s.name, slot);
+                } else {
+                    spdlog::info("[FH5OVERLAY] OverlayRenderer12 {} hook installed @0x{:X}", s.name, slot);
+                }
+            } else {
+                spdlog::warn("[FH5OVERLAY] OverlayRenderer12 {} vtable mismatch (slot=0x{:X} expected=0x{:X})",
+                             s.name, slot, expected);
+            }
+        }
+
+        const uintptr_t texbind = base + 0xE15C90;
+        g_overlay_texbind_hook = std::make_unique<FunctionHook>(Address{ texbind }, &Hook_OverlayTextureBind);
+        if (!g_overlay_texbind_hook->create()) {
+            g_overlay_texbind_hook.reset();
+            spdlog::warn("[FH5OVERLAY] sub_140E15C90 texture-bind hook create FAILED @0x{:X}", texbind);
+        } else {
+            spdlog::info("[FH5OVERLAY] sub_140E15C90 texture-bind hook installed @0x{:X}", texbind);
+        }
+
+        const uintptr_t psbind = base + 0xEA55D0;
+        g_overlay_psbind_hook = std::make_unique<FunctionHook>(Address{ psbind }, &Hook_OverlayPsBindingVf1);
+        if (!g_overlay_psbind_hook->create()) {
+            g_overlay_psbind_hook.reset();
+            spdlog::warn("[FH5OVERLAY] OverlayRendererPSParameters vf1 hook create FAILED @0x{:X}", psbind);
+        } else {
+            spdlog::info("[FH5OVERLAY] OverlayRendererPSParameters vf1 hook installed @0x{:X}", psbind);
+        }
+
+        // This is a very hot render-target bind body and is only useful for the discarded mode-29
+        // native-target probe. Leaving it installed during normal HUD quad runs produces tens of
+        // thousands of calls per second and has reproduced the NVIDIA stack-overflow crash bucket.
+        // Keep it as an explicit diagnostic, not part of the default overlay capture chain.
+        if (::GetEnvironmentVariableA("FH5VR_OVERLAY_TARGET_BIND_HOOK", nullptr, 0) > 0) {
+            const uintptr_t targetbind = base + 0x9AD3E0; // sub_1409AD3E0 render-target bind body.
+            g_overlay_target_bind_hook = std::make_unique<FunctionHook>(Address{ targetbind }, &Hook_OverlayNativeTargetBind);
+            if (!g_overlay_target_bind_hook->create()) {
+                g_overlay_target_bind_hook.reset();
+                spdlog::warn("[FH5OVERLAYTARGET] sub_1409AD3E0 target-bind hook create FAILED @0x{:X}", targetbind);
+            } else {
+                spdlog::info("[FH5OVERLAYTARGET] sub_1409AD3E0 target-bind hook installed @0x{:X}", targetbind);
+            }
+        } else {
+            spdlog::info("[FH5OVERLAYTARGET] sub_1409AD3E0 target-bind hook skipped (set FH5VR_OVERLAY_TARGET_BIND_HOOK=1 for diagnostics)");
+        }
+
+        const uintptr_t flush = base + 0xDF5910;
+        static constexpr unsigned char kFlushPrologue[] = {
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C,
+            0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48,
+        };
+        if (BytesMatchSEH(flush, kFlushPrologue, sizeof(kFlushPrologue))) {
+            g_overlay_flush_hook = std::make_unique<FunctionHook>(Address{ flush }, &Hook_OverlayImmediateFlush);
+            if (!g_overlay_flush_hook->create()) {
+                g_overlay_flush_hook.reset();
+                spdlog::warn("[FH5OVERLAY] sub_140DF5910 immediate-flush hook create FAILED @0x{:X}", flush);
+            } else {
+                spdlog::info("[FH5OVERLAY] sub_140DF5910 immediate-flush hook installed @0x{:X} (Empress prologue verified)", flush);
+            }
+        } else {
+            spdlog::warn("[FH5OVERLAY] sub_140DF5910 immediate-flush prologue mismatch @0x{:X}; hook skipped", flush);
+        }
     }
 
     return ok;

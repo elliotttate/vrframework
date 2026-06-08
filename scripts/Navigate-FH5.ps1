@@ -32,6 +32,8 @@ param(
     [int]$DriverSettleSec = 12,       # cockpit/driver cam is valid only after a longer quiet hold
     [int]$UnknownFallbackSec = 20,    # world3d held this long with an UNRESOLVED camera -> accept (anti-deadlock)
     [int]$StartupUnknownFallbackSec = 25, # only press the first startup Enter on unknown UI after this long
+    [int]$HubLoadSec = 7,             # the festival "My Cars" hub must be a stable/loaded menu this long before the single Escape
+    [int]$HubRetrySec = 14,           # if STILL at the hub this long after the Escape (it didn't land), allow ONE retry
     [switch]$SkipBootSequence,        # for attaching to an already-running game; starts in post-menu handling
     [switch]$UseXInput,             # also emit controller commands to the in-process injector
     [switch]$MonitorOnly            # observe + print only; never send input
@@ -44,7 +46,7 @@ if (-not (Get-Command Send-FH5GameKey -ErrorAction SilentlyContinue)) {
 }
 
 # Virtual-key codes.
-$VK = @{ Enter = 0x0D; Esc = 0x1B; Up = 0x26; Down = 0x28; Left = 0x25; Right = 0x27 }
+$VK = @{ Enter = 0x0D; Esc = 0x1B; Up = 0x26; Down = 0x28; Left = 0x25; Right = 0x27; Space = 0x20 }
 
 $script:navSeq  = 0
 $script:lastAct = @{}
@@ -118,6 +120,20 @@ $menuContinueSent = $false
 $showcaseDriverEscapeSent = $false
 $postShowcaseEscapeSince = $null
 $startupUnknownSince = $null
+# Festival "My Cars" hub -> game: the game loads to the My Cars/Garage hub menu; a SINGLE Escape from it
+# enters free-roam/race. A SECOND Escape toggles back to the hub. So we press Escape exactly ONCE, only after
+# the hub has fully loaded (stable $HubLoadSec), and never again once in-game ($gameEntered latches true).
+$gameEntered = $false
+$hubStableSince = $null
+$hubEscapeAt = $null
+$hubEscapeCount = 0
+# The My-Cars festival hub reads in the state file as world3d/CCamDriver/screen=Splash -- IDENTICAL to real
+# free-roam (the hub renders a 3D driving-camera scene behind the menu). So we cannot detect it from state.
+# Instead, once a stable driving-camera state is reached we press SPACE ("Drive", per the on-screen hint),
+# which ENTERS free-roam from the hub and is a harmless accelerate-tap if already driving -- it NEVER opens a
+# menu (unlike Escape, which toggles). $driveSent ensures we send it a bounded number of times.
+$driveSent = 0
+$driveSentAt = $null
 
 while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process ForzaHorizon5 -ErrorAction SilentlyContinue)) { Write-Output 'RESULT=CRASH (FH5 not running)'; exit 2 }
@@ -227,15 +243,32 @@ while ((Get-Date) -lt $deadline) {
         continue
     }
 
-    if (($trustedOverlayMenu -or $uiPagesOverlay) -and -not ($drivingCameraLike -and [string]$s['gameplay'] -eq '1')) {
+    # The festival "My Cars"/Garage HUB is the post-load menu. CRITICAL: the hub renders a 3D driving-camera
+    # scene BEHIND the menu, so the camera reads as CCamDriver while a GARAGE/CarSelectGarage menu UI is on top.
+    # The flow is: load -> HUB (menu over a 3D scene) -> ONE Escape -> free-roam/race. So whenever a hub MENU
+    # UI is present we must Escape it (NOT treat the 3D-scene camera as free-roam). We wait for it to FULLY load
+    # ($HubLoadSec) then press Escape ONCE; retry only if STILL at the hub $HubRetrySec later. We only reach the
+    # scene switch (which declares READY) once NO hub menu UI remains -> guarantees READY = real free-roam.
+    $hubLike = ($trustedOverlayMenu -or $uiPagesOverlay -or $camForState -eq 'CCamFollowExtended')
+    if ($hubLike) {
         $worldSince = $null
         $driverSince = $null
-        if (CoolOK "trusted-overlay-$screenForState-$uiBlockingPages" 4000) {
-            Send-NamedKey $OverlayCleanupKey "trusted post-menu overlay cleanup ($screenForState block=$uiBlockingPages raw=$uiPages)"
+        if ($null -eq $hubStableSince) {
+            $hubStableSince = Get-Date
+            Write-Output "  festival hub MENU present ($screenForState block=$uiBlockingPages cam=$camForState ui=$uiPages); letting it FULLY load (${HubLoadSec}s) before the single Escape..."
+        }
+        elseif (((Get-Date) - $hubStableSince).TotalSeconds -ge $HubLoadSec -and
+                ($hubEscapeCount -eq 0 -or ($hubEscapeAt -and ((Get-Date) - $hubEscapeAt).TotalSeconds -ge $HubRetrySec))) {
+            $hubEscapeCount++
+            Send-NamedKey 'Escape' "enter game from festival hub [single Escape #$hubEscapeCount] ($screenForState)"
+            $hubEscapeAt = Get-Date
+            $gameEntered = $true   # we've performed the entering Escape; suppress other Escape-senders below
         }
         Start-Sleep -Milliseconds 800
         continue
     }
+    # No hub menu UI -> re-arm the hub-load timer so a future hub re-show needs a fresh full-load hold.
+    $hubStableSince = $null
 
     switch ($scene) {
         'world3d' {
@@ -260,12 +293,21 @@ while ((Get-Date) -lt $deadline) {
                 $worldSince = $null
                 if ($null -eq $driverSince) {
                     $driverSince = Get-Date
-                    Write-Output "  -> cockpit/driver camera candidate; requiring quiet hold..."
+                    Write-Output "  -> cockpit/driver candidate (could be the My-Cars hub, indistinguishable in state); will press Drive to enter free-roam..."
                 }
                 else {
+                    # The My-Cars festival hub looks identical to free-roam in the state file. Press SPACE
+                    # ("Drive", per the on-screen hint) up to 3x (3s apart) to ENTER free-roam from the hub.
+                    # Space is non-toggling: it drives from the hub, harmlessly accelerates if already free-roam,
+                    # and NEVER opens a menu. Then READY after the post-Drive quiet hold.
+                    if ($driveSent -lt 3 -and ($null -eq $driveSentAt -or ((Get-Date) - $driveSentAt).TotalSeconds -ge 3)) {
+                        $driveSent++
+                        Send-Key $VK.Space "Drive: enter free-roam from My-Cars hub (Space) [#$driveSent]"
+                        $driveSentAt = Get-Date
+                    }
                     $quietSec = if ($script:lastInputAt) { ((Get-Date) - $script:lastInputAt).TotalSeconds } else { 9999 }
-                    if (((Get-Date) - $driverSince).TotalSeconds -ge $DriverSettleSec -and $quietSec -ge $DriverSettleSec) {
-                        Write-Output "RESULT=READY (free-roam: driver camera quiet for ${DriverSettleSec}s)"; exit 0
+                    if ($driveSent -ge 1 -and ((Get-Date) - $driverSince).TotalSeconds -ge $DriverSettleSec -and $quietSec -ge $DriverSettleSec) {
+                        Write-Output "RESULT=READY (free-roam: driver camera, drove from hub, quiet ${DriverSettleSec}s)"; exit 0
                     }
                 }
             }
@@ -289,7 +331,7 @@ while ((Get-Date) -lt $deadline) {
             elseif ($cam -match '^CCam(Free|FreeTargetCar|FreeTrack)$') {
                 $worldSince = $null
                 $driverSince = $null
-                if (CoolOK 'world3dback' 6000) {
+                if (-not $gameEntered -and (CoolOK 'world3dback' 6000)) {
                     Send-Key $VK.Esc "back out of non-driving 3D camera ($cam)"
                     Send-Pad 'B' 'back'
                 }
@@ -297,7 +339,7 @@ while ((Get-Date) -lt $deadline) {
             else {
                 $worldSince = $null
                 $driverSince = $null
-                if (CoolOK 'world3dback' 6000) {
+                if (-not $gameEntered -and (CoolOK 'world3dback' 6000)) {
                     Send-Key $VK.Esc "back out of unresolved/non-driving 3D camera ($cam)"
                     Send-Pad 'B' 'back'
                 }
@@ -312,19 +354,25 @@ while ((Get-Date) -lt $deadline) {
             if ($cam -eq 'CCamDriver') {
                 if ($null -eq $driverSince) {
                     $driverSince = Get-Date
-                    Write-Output "  -> showcase-labeled driver candidate; requiring quiet hold..."
+                    Write-Output "  -> showcase-labeled driver candidate (could be the My-Cars hub); will press Drive..."
                 }
                 else {
+                    # Same as world3d: press SPACE ("Drive") to enter free-roam from the My-Cars hub (non-toggling).
+                    if ($driveSent -lt 3 -and ($null -eq $driveSentAt -or ((Get-Date) - $driveSentAt).TotalSeconds -ge 3)) {
+                        $driveSent++
+                        Send-Key $VK.Space "Drive: enter free-roam from My-Cars hub (Space) [#$driveSent]"
+                        $driveSentAt = Get-Date
+                    }
                     $quietSec = if ($script:lastInputAt) { ((Get-Date) - $script:lastInputAt).TotalSeconds } else { 9999 }
                     $driverHeldSec = ((Get-Date) - $driverSince).TotalSeconds
-                    if ($driverHeldSec -ge $DriverSettleSec -and $quietSec -ge $DriverSettleSec) {
-                        Write-Output "RESULT=READY (showcase-labeled driver camera quiet for ${DriverSettleSec}s)"; exit 0
+                    if ($driveSent -ge 1 -and $driverHeldSec -ge $DriverSettleSec -and $quietSec -ge $DriverSettleSec) {
+                        Write-Output "RESULT=READY (showcase driver camera, drove from hub, quiet ${DriverSettleSec}s)"; exit 0
                     }
                 }
             }
             else {
                 $driverSince = $null
-                if (CoolOK 'showcaseback' 6000) { Send-Key $VK.Esc 'back out of post-menu 3D overlay'; Send-Pad 'B' 'back' }
+                if (-not $gameEntered -and (CoolOK 'showcaseback' 6000)) { Send-Key $VK.Esc 'back out of post-menu 3D overlay'; Send-Pad 'B' 'back' }
             }
         }
         default {
@@ -335,7 +383,7 @@ while ((Get-Date) -lt $deadline) {
             if ($frontMenuLike) {
                 if (CoolOK 'frontmenuretry' 7000) { Send-Key $VK.Enter 'front menu continue retry'; Send-Pad 'A' 'front menu continue' }
             }
-            elseif (CoolOK 'postmenuback' 7000) {
+            elseif (-not $gameEntered -and (CoolOK 'postmenuback' 7000)) {
                 Send-Key $VK.Esc 'post-menu back/cleanup'
                 Send-Pad 'B' 'back'
             }

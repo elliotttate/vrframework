@@ -185,7 +185,7 @@ foreach(dep IN LISTS VRFRAMEWORK_DEPS)
     endif()
 endforeach()
 
-target_link_libraries(vrframework PUBLIC d3d11 d3d12 dxgi)
+target_link_libraries(vrframework PUBLIC d3d11 d3d12 dxgi d3dcompiler)
 
 # Make the OpenXR (simulator) headers visible to the core's OpenXR runtime port.
 target_include_directories(vrframework PUBLIC "${OPENXR_SIM_INCLUDE_DIR}")
