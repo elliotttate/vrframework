@@ -11,6 +11,8 @@
 #include "Fh5CamDriver.hpp"
 #include "Fh5Adapter.hpp"
 #include "Fh5CameraCbuffer.hpp"
+#include "Mods.hpp"          // complete type for unique_ptr<Mods> in Framework: this TU references g_framework,
+                             // so ~Framework -> ~unique_ptr<Mods> instantiates here and needs Mods defined.
 
 #include <windows.h>
 
@@ -26,6 +28,12 @@
 #include <vector>
 
 namespace fh5cam {
+void Tick1688DataHeadlook();   // 1.688 no-.text-hook DATA head-look (defined below; called from WorkerThread)
+// RETAIL 1.688 head-look levers, defined below (after apply_angle_head_rotation_prewrite) and called from
+// Tick1688DataHeadlook. Declared here (NOT in Fh5CamDriver.hpp) on purpose: keeping them out of the header
+// avoids re-triggering a recompile of the other fh5vr TUs (Fh5Adapter/Fh5MenuNav) that include it.
+bool apply_freelook_headlook_1688(uintptr_t cam);   // +0x5C4 yaw / +0x5F4 pitch / +0x5F8 roll (rot=freelook)
+bool apply_ypr540_headlook_1688(uintptr_t cam);     // +0x540 CameraSpaceYPR input lane (rot=ypr540)
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -81,6 +89,36 @@ constexpr uintptr_t kKnownMulticamVtableIdaVas[] = {
     0x1465D6808ull, // Camera::ForzaMultiCam concrete table, Empress
     0x1465D6BA0ull, // Camera::ForzaMultiCam concrete table variant, Empress
 };
+
+constexpr uintptr_t k1688KnownMulticamVtableIdaVas[] = {
+    0x147050068ull, // Camera::ForzaMultiCam concrete table, Steam 1.688
+    0x147050408ull, // Camera::ForzaMultiCam secondary table at object+0x530, Steam 1.688
+};
+
+// Retail 1.688 ForzaMultiCam refcount vftable (std::_Ref_count_obj2<Camera::ForzaMultiCam>) and concrete
+// vtables. Camera-type concrete vtables are still not mapped on 1.688, so the active camera itself is validated
+// structurally by its +0x320 basis after the owner ForzaMultiCam vtable matches. Build is fingerprinted by the
+// 1.688 pose-writer prologue at RVA 0xF75430.
+constexpr uintptr_t k1688ForzaMultiCamRefcountIdaVa = 0x147053C50ull;
+
+// 1.688 pose-writer prologue (Fh5Adapter's fingerprint) — used here only to detect the retail build so the
+// camera resolution/head-look relax to structural validation (no Empress vtable list on 1.688).
+inline bool IsRetail1688Build() {
+    static const int detected = [] {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (!base) return 0;
+        static const unsigned char kPoseWriter[] = {
+            0x48,0x8B,0xC4, 0x48,0x89,0x58,0x08, 0x48,0x89,0x70,0x10, 0x48,0x89,0x78,0x18,
+            0x4C,0x89,0x70,0x20, 0x55, 0x48,0x8D,0x68,0xC8, 0x48,0x81,0xEC,0x30,0x01,0x00,0x00
+        };
+        __try {
+            const auto* p = reinterpret_cast<const unsigned char*>(base + 0xF75430);
+            for (size_t i = 0; i < sizeof(kPoseWriter); ++i) if (p[i] != kPoseWriter[i]) return 0;
+            return 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }();
+    return detected != 0;
+}
 
 // ---------------------------------------------------------------------------
 // Resolved-once globals (the worker thread is the only writer/reader after start).
@@ -221,16 +259,24 @@ Vec3 Scale(const Vec3& v, float s);
 Vec3 TransformDirection(const Pose& base, const Vec3& local);
 void Orthonormalize(Pose& pose);
 Matrix4 MatrixFromPose(const Pose& pose);
+bool SnapshotPoseHint(Pose& hint);
 bool RestoreInput540Base(uintptr_t object);
 bool EnsureModuleBase();
 bool IsKnownCameraVtable(uintptr_t vtable);
 bool IsKnownCameraRefcountVtable(uintptr_t vtable);
 bool IsKnownMulticamVtable(uintptr_t vtable);
+bool IsRetail1688MulticamVtable(uintptr_t vtable);
 bool IsCinematicGameCameraRefcountVtable(uintptr_t vtable);
 bool IsCCamDriverVtable(uintptr_t vtable);
 bool LooksLikeCameraObjectHeader(uintptr_t object, uintptr_t* vtable_out = nullptr);
 bool LooksLikeCameraControlHeader(uintptr_t control, uintptr_t* vtable_out = nullptr);
 bool TryDecodeCameraPointer(uintptr_t value, uintptr_t& object);
+bool TryDecodeRetail1688CameraPointer(uintptr_t value,
+                                      const Pose& hint,
+                                      uintptr_t& object,
+                                      Pose& pose_out,
+                                      float& basis_score_out,
+                                      uintptr_t& vtable_out);
 float CameraClassPriorityFromRefcountIda(uintptr_t ida_va);
 float CameraClassPriorityFromVtable(uintptr_t vtable);
 bool ReadActiveDriverFromMulticam(uintptr_t multicam_object, uintptr_t& object);
@@ -416,6 +462,10 @@ bool IsWritableDataProtect(DWORD protect) {
     return base == PAGE_READWRITE || base == PAGE_WRITECOPY;
 }
 
+bool IsPlausibleUserPointer(uintptr_t value) {
+    return value >= 0x10000ull && value < 0x0000800000000000ull;
+}
+
 bool AcceptMulticamCandidate(uintptr_t control) {
     const uintptr_t object = control + kObjectStorageOffset;
     const uintptr_t active_slot = object + kActiveCameraSlotOffset;
@@ -426,13 +476,28 @@ bool AcceptMulticamCandidate(uintptr_t control) {
     if (!SafeRead(active_slot, active_object) ||
         !SafeRead(active_slot + sizeof(uintptr_t), active_control) ||
         !active_object ||
-        !SafeRead(object, multicam_vtbl) ||
-        !IsKnownMulticamVtable(multicam_vtbl)) {
+        !SafeRead(object, multicam_vtbl)) {
         return false;
     }
-    if (!TryDecodeCameraPointer(active_object, decoded_active) &&
-        !TryDecodeCameraPointer(active_control, decoded_active)) {
-        return false;
+    const bool retail1688 = IsRetail1688Build();
+    if (retail1688) {
+        if (!IsRetail1688MulticamVtable(multicam_vtbl)) return false;
+
+        Pose decoded_pose{};
+        float decoded_basis = -1000.0f;
+        uintptr_t decoded_vtable = 0;
+        Pose hint{};
+        SnapshotPoseHint(hint);
+        if (!TryDecodeRetail1688CameraPointer(active_object, hint, decoded_active, decoded_pose, decoded_basis, decoded_vtable) &&
+            !TryDecodeRetail1688CameraPointer(active_control, hint, decoded_active, decoded_pose, decoded_basis, decoded_vtable)) {
+            return false;
+        }
+    } else {
+        if (!IsKnownMulticamVtable(multicam_vtbl)) return false;
+        if (!TryDecodeCameraPointer(active_object, decoded_active) &&
+            !TryDecodeCameraPointer(active_control, decoded_active)) {
+            return false;
+        }
     }
     g_multicam_control = control;
     g_multicam_object = object;
@@ -484,7 +549,8 @@ bool ResolveMulticam() {
     if (!g_module_base) g_module_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if (!g_module_base) return false;
     if (kForzaMultiCamRefcountIdaVa == 0) return false;
-    const uintptr_t multicam_vtbl = g_module_base + (kForzaMultiCamRefcountIdaVa - kIdaImageBase);
+    const uintptr_t refcount_ida = IsRetail1688Build() ? k1688ForzaMultiCamRefcountIdaVa : kForzaMultiCamRefcountIdaVa;
+    const uintptr_t multicam_vtbl = g_module_base + (refcount_ida - kIdaImageBase);
     g_driver_vtbl = g_module_base + (kCCamDriverRefcountIdaVa - kIdaImageBase);
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
@@ -617,6 +683,58 @@ bool ResolveCameraLayout(uintptr_t object,
     return false;
 }
 
+bool ResolveRetail1688CameraLayout(uintptr_t object,
+                                   const Pose& hint,
+                                   Matrix4& matrix_out,
+                                   Pose& pose_out,
+                                   float& basis_score_out,
+                                   uintptr_t& identity_vtable_out,
+                                   CameraLayout& layout_out,
+                                   float min_basis) {
+    matrix_out = {};
+    pose_out = {};
+    basis_score_out = -1000.0f;
+    identity_vtable_out = 0;
+    layout_out = {};
+    if (!IsRetail1688Build() || object < 0x10000ull) return false;
+
+    Matrix4 matrix{};
+    Pose pose{};
+    if (!SafeCopyIn(object + kCameraMatrixOffset, matrix.m.data(), sizeof(float) * matrix.m.size()) ||
+        !DecodePose(matrix, pose)) {
+        return false;
+    }
+
+    const float basis_score = BasisScore(pose, hint);
+    if (basis_score < min_basis) return false;
+
+    float discr = 0.0f;
+    if (SafeRead(object + 0x31C, discr) &&
+        std::isfinite(discr) &&
+        std::fabs(discr - 1.0f) > 0.25f) {
+        return false;
+    }
+
+    uintptr_t object_vtable = 0;
+    SafeRead(object, object_vtable);
+    object_vtable = EffectiveObjectVtable(object, object_vtable);
+
+    CameraLayout layout{};
+    layout.matrix_offset = kCameraMatrixOffset;
+    layout.view_tail_offset = kViewTailOffset;
+    layout.identity_vtable = object_vtable;
+    layout.class_priority = 2.50f;
+    layout.name = "retail1688_struct";
+    layout.writes_view_tail = true;
+
+    matrix_out = matrix;
+    pose_out = pose;
+    basis_score_out = basis_score;
+    identity_vtable_out = object_vtable;
+    layout_out = layout;
+    return true;
+}
+
 bool ValidateCameraObject(uintptr_t object,
                           const Pose& hint,
                           Pose& pose_out,
@@ -626,6 +744,74 @@ bool ValidateCameraObject(uintptr_t object,
     Matrix4 matrix{};
     CameraLayout layout{};
     return ResolveCameraLayout(object, hint, matrix, pose_out, basis_score_out, vtable_out, layout, min_basis);
+}
+
+bool ValidateRetail1688CameraObject(uintptr_t object,
+                                    const Pose& hint,
+                                    Pose& pose_out,
+                                    float& basis_score_out,
+                                    uintptr_t& vtable_out,
+                                    float min_basis = -3.0f) {
+    Matrix4 matrix{};
+    CameraLayout layout{};
+    return ResolveRetail1688CameraLayout(object, hint, matrix, pose_out, basis_score_out, vtable_out, layout, min_basis);
+}
+
+bool TryDecodeRetail1688CameraPointer(uintptr_t value,
+                                      const Pose& hint,
+                                      uintptr_t& object,
+                                      Pose& pose_out,
+                                      float& basis_score_out,
+                                      uintptr_t& vtable_out) {
+    object = 0;
+    pose_out = {};
+    basis_score_out = -1000.0f;
+    vtable_out = 0;
+    if (!IsRetail1688Build() || !IsPlausibleUserPointer(value)) return false;
+
+    const uintptr_t candidates[] = {
+        value,
+        value + kObjectStorageOffset,
+        value > kObjectStorageOffset ? value - kObjectStorageOffset : 0,
+    };
+    for (uintptr_t candidate : candidates) {
+        if (!IsPlausibleUserPointer(candidate)) continue;
+        Pose pose{};
+        float basis_score = -1000.0f;
+        uintptr_t vtable = 0;
+        if (ValidateRetail1688CameraObject(candidate, hint, pose, basis_score, vtable)) {
+            object = candidate;
+            pose_out = pose;
+            basis_score_out = basis_score;
+            vtable_out = vtable;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReadActiveRetail1688CameraFromMulticam(uintptr_t multicam_object,
+                                            const Pose& hint,
+                                            uintptr_t& object,
+                                            Pose& pose_out,
+                                            float& basis_score_out,
+                                            uintptr_t& vtable_out) {
+    object = 0;
+    pose_out = {};
+    basis_score_out = -1000.0f;
+    vtable_out = 0;
+    if (!IsRetail1688Build() || multicam_object < 0x10000ull) return false;
+
+    uintptr_t slot0 = 0;
+    uintptr_t slot1 = 0;
+    if (!SafeRead(multicam_object + kActiveCameraSlotOffset, slot0) ||
+        !SafeRead(multicam_object + kActiveCameraSlotOffset + sizeof(uintptr_t), slot1)) {
+        return false;
+    }
+
+    if (TryDecodeRetail1688CameraPointer(slot0, hint, object, pose_out, basis_score_out, vtable_out)) return true;
+    if (TryDecodeRetail1688CameraPointer(slot1, hint, object, pose_out, basis_score_out, vtable_out)) return true;
+    return false;
 }
 
 bool AcceptScannedMulticamObject(uintptr_t object,
@@ -642,7 +828,27 @@ bool AcceptScannedMulticamObject(uintptr_t object,
     active_vtable_out = 0;
 
     if (object < 0x10000ull) return false;
-    if (!SafeRead(object, multicam_vtable_out) || !IsKnownMulticamVtable(multicam_vtable_out)) return false;
+    if (!SafeRead(object, multicam_vtable_out)) return false;
+
+    if (IsRetail1688Build()) {
+        if (!IsRetail1688MulticamVtable(multicam_vtable_out)) return false;
+
+        uintptr_t active = 0;
+        if (!ReadActiveRetail1688CameraFromMulticam(object,
+                                                    hint,
+                                                    active,
+                                                    active_pose_out,
+                                                    basis_score_out,
+                                                    active_vtable_out)) {
+            return false;
+        }
+        active_out = active;
+        g_multicam_object = object;
+        g_active_slot = object + kActiveCameraSlotOffset;
+        return true;
+    }
+
+    if (!IsKnownMulticamVtable(multicam_vtable_out)) return false;
 
     uintptr_t active = 0;
     if (!ReadActiveDriverFromMulticam(object, active)) return false;
@@ -866,22 +1072,26 @@ bool ResolveMulticamByScan(const Pose& hint, uintptr_t& multicam_out, uintptr_t&
     };
     std::vector<ScanTarget> targets{};
     targets.reserve(kKnownMulticamCount + 1);
-    if (kForzaMultiCamRefcountIdaVa != 0) {
+    const bool retail1688 = IsRetail1688Build();
+    const uintptr_t refcount_ida = retail1688 ? k1688ForzaMultiCamRefcountIdaVa : kForzaMultiCamRefcountIdaVa;
+    if (refcount_ida != 0) {
         targets.push_back({
-            g_module_base + (kForzaMultiCamRefcountIdaVa - kIdaImageBase),
-            kForzaMultiCamRefcountIdaVa,
+            g_module_base + (refcount_ida - kIdaImageBase),
+            refcount_ida,
             true,
-            "refcount"
+            retail1688 ? "retail_refcount" : "refcount"
         });
     }
-    for (size_t i = 0; i < kKnownMulticamCount; ++i) {
-        if (kKnownMulticamVtableIdaVas[i] == 0) continue;
-        targets.push_back({
-            g_module_base + (kKnownMulticamVtableIdaVas[i] - kIdaImageBase),
-            kKnownMulticamVtableIdaVas[i],
-            false,
-            "object"
-        });
+    if (!retail1688) {
+        for (size_t i = 0; i < kKnownMulticamCount; ++i) {
+            if (kKnownMulticamVtableIdaVas[i] == 0) continue;
+            targets.push_back({
+                g_module_base + (kKnownMulticamVtableIdaVas[i] - kIdaImageBase),
+                kKnownMulticamVtableIdaVas[i],
+                false,
+                "object"
+            });
+        }
     }
     if (targets.empty()) return false;
 
@@ -997,30 +1207,37 @@ bool ResolveMulticamByScan(const Pose& hint, uintptr_t& multicam_out, uintptr_t&
                                 SafeRead(multicam_object, fmc_vtable_diag);
                                 SafeRead(multicam_object + kActiveCameraSlotOffset, slot_object);
                                 SafeRead(multicam_object + kActiveCameraSlotOffset + sizeof(uintptr_t), slot_control);
-                                if (slot_control) SafeRead(slot_control, slot_control_vtable);
-                                if (slot_object) SafeRead(slot_object, active_vtable_diag);
+                                if (IsPlausibleUserPointer(slot_control)) SafeRead(slot_control, slot_control_vtable);
+                                if (IsPlausibleUserPointer(slot_object)) SafeRead(slot_object, active_vtable_diag);
 
                                 Pose diag_pose{};
                                 float diag_basis = -1000.0f;
                                 uintptr_t diag_active_vtable = 0;
-                                const bool camera_ok = ValidateCameraObject(slot_object,
-                                                                            hint,
-                                                                            diag_pose,
-                                                                            diag_basis,
-                                                                            diag_active_vtable);
+                                const bool retail1688 = IsRetail1688Build();
+                                const bool camera_ok = retail1688 ?
+                                    ValidateRetail1688CameraObject(slot_object,
+                                                                   hint,
+                                                                   diag_pose,
+                                                                   diag_basis,
+                                                                   diag_active_vtable) :
+                                    ValidateCameraObject(slot_object,
+                                                         hint,
+                                                         diag_pose,
+                                                         diag_basis,
+                                                         diag_active_vtable);
                                 spdlog::info("[FH5CAM] ForzaMultiCam candidate rejected target={} ida=0x{:X} hit=0x{:X} object=0x{:X} fmc_vtbl=0x{:X} fmc_known={} slot_obj=0x{:X} slot_ctrl=0x{:X} slot_ctrl_vtbl=0x{:X} relation={} active_vtbl=0x{:X} active_known={} camera_ok={} basis={:.3f}",
                                              target.label,
                                              target.ida_va,
                                              hit_address,
                                              multicam_object,
                                              fmc_vtable_diag,
-                                             IsKnownMulticamVtable(fmc_vtable_diag) ? 1 : 0,
+                                             (retail1688 ? IsRetail1688MulticamVtable(fmc_vtable_diag) : IsKnownMulticamVtable(fmc_vtable_diag)) ? 1 : 0,
                                              slot_object,
                                              slot_control,
                                              slot_control_vtable,
                                              (slot_control && slot_object == slot_control + kObjectStorageOffset) ? 1 : 0,
                                              active_vtable_diag,
-                                             IsKnownCameraVtable(active_vtable_diag) ? 1 : 0,
+                                             (retail1688 ? (active_vtable_diag != 0) : IsKnownCameraVtable(active_vtable_diag)) ? 1 : 0,
                                              camera_ok ? 1 : 0,
                                              diag_basis);
                             }
@@ -1592,6 +1809,11 @@ bool IsKnownCameraRefcountVtable(uintptr_t vtable) {
 bool IsKnownMulticamVtable(uintptr_t vtable) {
     return MatchesKnownVtable(vtable, kKnownMulticamVtableIdaVas,
                               sizeof(kKnownMulticamVtableIdaVas) / sizeof(kKnownMulticamVtableIdaVas[0]));
+}
+
+bool IsRetail1688MulticamVtable(uintptr_t vtable) {
+    return MatchesKnownVtable(vtable, k1688KnownMulticamVtableIdaVas,
+                              sizeof(k1688KnownMulticamVtableIdaVas) / sizeof(k1688KnownMulticamVtableIdaVas[0]));
 }
 
 bool IsCinematicGameCameraRefcountVtable(uintptr_t vtable) {
@@ -2199,6 +2421,15 @@ DWORD WINAPI WorkerThread(void*) {
     std::vector<CloneTarget> camera_clones;
     bool have_scanned_clones = false;
     for (;;) {
+        // Retail 1.688: NO inline .text camera hooks (anti-tamper kills them), so head-look runs entirely from
+        // this worker via DATA writes — a hook-free ForzaMultiCam vtable scan + structural camera validation +
+        // a +0x320 compose. The Empress flow below relies on hook-published pointers and per-build vtables that
+        // don't exist on retail, so skip it.
+        if (IsRetail1688Build()) {
+            Tick1688DataHeadlook();
+            Sleep(3);
+            continue;
+        }
         const int tgt = fh5cb::ctl_up_tgt();
         const int current_pos_lane = fh5cb::ctl_pos_lane();
         if (last_pos_lane == fh5cb::kPosLaneInput540 &&
@@ -2930,6 +3161,156 @@ bool apply_camdriver_head_rotation(uintptr_t object) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 1.688 NO-.text-HOOK DATA head-look. Retail FH5's integrity check CRCs .text and kills the process when it
+// sees our inline (safetyhook) prologue patches; the present/device hooks + DATA writes are invisible to it
+// (bisect-proven). So on 1.688 we install NO camera .text hooks; instead this runs from the WORKER thread:
+//   (a) resolve the ForzaMultiCam hook-free via the vtable scan (k1688ForzaMultiCamRefcountIdaVa),
+//   (b) read the active camera structurally (+0x5C8 active slot; validate by +0x320 orthonormality, NOT by
+//       the per-build concrete vtables, which are unmapped on 1.688),
+//   (c) compose the published VR head rotation onto the camera's +0x320 cam-to-world matrix (DATA write).
+// Tradeoff: the worker write races the engine's per-frame +0x320 rebuild (may jitter) — the proven inline
+// path can't be used on retail. rot=off disables. Empress is unaffected (IsRetail1688Build()==false).
+// ---------------------------------------------------------------------------
+namespace {
+uintptr_t g_dc_multicam = 0;
+uintptr_t g_dc_camera = 0;
+uint64_t  g_dc_last_scan_ms = 0;
+uint64_t  g_dc_invalid_since_ms = 0;
+uintptr_t g_dc_base_obj = 0;
+Matrix4   g_dc_base{};
+Matrix4   g_dc_written{};
+
+bool Cam320IsOrthonormal(uintptr_t cam, Matrix4& cur_out) {
+    if (cam < 0x10000ull) return false;
+    Matrix4 cur{};
+    if (!SafeCopyIn(cam + kCameraMatrixOffset, cur.m.data(), sizeof(float) * cur.m.size())) return false;
+    Pose decoded{};
+    if (!DecodePose(cur, decoded)) return false;
+    cur_out = cur;
+    return true;
+}
+
+// Cheap re-validation of a cached camera object: the active-camera gate float at +0x31C ~ 1.0 AND an
+// orthonormal +0x320 cam-to-world. A freed/reused object won't pass both, so this guards against staleness.
+bool Cam1688Valid(uintptr_t cam) {
+    if (cam < 0x10000ull) return false;
+    float discr = 0.0f;
+    if (!SafeRead(cam + 0x31C, discr) || std::fabs(discr - 1.0f) > 1.0e-2f) return false;
+    Matrix4 m{};
+    return Cam320IsOrthonormal(cam, m);
+}
+
+// Resolve the active gameplay camera only through the retail ForzaMultiCam owner. The previous loose
+// camera-shaped heap scan was useful for RE, but it can lock the wrong transient object and burns hundreds of
+// MB of reads after a miss. Retail production should fail closed and wait for a valid ForzaMultiCam refcount hit.
+uint64_t g_dc_scan_count = 0;
+uintptr_t ScanForCamera1688() {
+    ++g_dc_scan_count;
+    Pose hint{};
+    SnapshotPoseHint(hint);
+
+    uintptr_t multicam = 0;
+    uintptr_t active = 0;
+    if (ResolveMulticamByScan(hint, multicam, active)) {
+        g_dc_multicam = multicam;
+        spdlog::info("[FH5DATACAM] camera scan#{}: ForzaMultiCam active camera multicam=0x{:X} active=0x{:X}",
+                     g_dc_scan_count, multicam, active);
+        return active;
+    }
+
+    spdlog::warn("[FH5DATACAM] camera scan#{}: ForzaMultiCam active-camera resolve failed; no loose heap fallback on retail",
+                 g_dc_scan_count);
+    return 0;
+}
+} // namespace
+
+void Tick1688DataHeadlook() {
+    if (!IsRetail1688Build()) return;
+    if (fh5cb::ctl_rotation_mode() == 0) return;   // rot=off
+
+    // (a) Lock the active camera, then cache it. STABILITY: the region scan memcpy's up to ~768MB; running it
+    // repeatedly during FH5's fragile boot/load phase hung the game at ~0fps (only ~10 presents in 43 min). So:
+    //   * never scan during the first 90s of mod uptime (the boot/load window — no gameplay camera exists yet),
+    //   * scan at most every 12s while uncached,
+    //   * once locked, NEVER re-scan unless Cam1688Valid fails continuously for >30s (handles a real scene
+    //     camera move without re-scanning on transient gate flicker).
+    static uint64_t s_worker_start_ms = 0;
+    const uint64_t now = NowMs();
+    if (s_worker_start_ms == 0) s_worker_start_ms = now;
+
+    if (g_dc_camera != 0) {
+        if (Cam1688Valid(g_dc_camera)) { g_dc_invalid_since_ms = 0; }
+        else {
+            if (g_dc_invalid_since_ms == 0) g_dc_invalid_since_ms = now;
+            if (now - g_dc_invalid_since_ms > 30000) g_dc_camera = 0;   // sustained loss -> allow re-scan
+            else return;                                               // transient flicker -> skip this tick
+        }
+    }
+    if (g_dc_camera == 0) {
+        if (now - s_worker_start_ms < 90000) return;   // skip the fragile boot/load window entirely
+        if (now - g_dc_last_scan_ms < 12000) return;
+        g_dc_last_scan_ms = now;
+        const uintptr_t found = ScanForCamera1688();
+        if (found == 0) return;            // no active gameplay camera yet
+        g_dc_camera = found;
+        g_dc_invalid_since_ms = 0;
+        spdlog::info("[FH5DATACAM] active camera LOCKED 0x{:X}", g_dc_camera);
+    }
+    const uintptr_t cam = g_dc_camera;
+    const int rotmode = fh5cb::ctl_rotation_mode();
+
+    // (c) Head-look. Several no-.text-hook levers, switchable LIVE via the ctl file (rot=...):
+    //   rot=angle (3): inject head Euler at cam+0x90/94/98 — the proven Empress lever. INERT on retail: the
+    //                  +0x31C/+0x320-scan camera is a look-at camera with no radian Euler at +0x90 (bails).
+    //   rot=freelook (4): write the engine's NATIVE cockpit free-look angles +0x5C4 yaw / +0x5F4 pitch / +0x5F8
+    //                     roll (consumed during the engine's own camera build -> view+cull+cascades coherent).
+    //   rot=ypr540 (5): write the +0x540 CameraSpaceYPR input lane (tag=0 + pitch/yaw/roll).
+    // The +0x90 lever rebuilds +0x320 from the angles, so it also keeps a +0x320 matrix fallback for frames the
+    // engine doesn't rebuild. The freelook/ypr540 levers write engine input fields and need no matrix fallback.
+    bool angle_applied = false, fl_applied = false, ypr_applied = false;
+    if      (rotmode == 3) angle_applied = apply_angle_head_rotation_prewrite(cam);
+    else if (rotmode == 4) fl_applied    = apply_freelook_headlook_1688(cam);
+    else if (rotmode == 5) ypr_applied   = apply_ypr540_headlook_1688(cam);
+
+    float s = 0, u = 0, f = 0; Pose delta{}; int eye = 0;
+    if (rotmode == 3 && !angle_applied && SnapshotOpenXrPose(s, u, f, delta, eye)) {   // +0x320 fallback ONLY if +0x90 didn't take
+        Matrix4 cur{};
+        if (Cam320IsOrthonormal(cam, cur)) {
+            if (g_dc_base_obj != cam) { g_dc_base_obj = cam; g_dc_base = cur; }
+            else if (!MatricesClose16(cur, g_dc_written, 1e-3f)) { g_dc_base = cur; }
+            Matrix4 rot{};
+            rot.m[0]=delta.right.x;   rot.m[1]=delta.right.y;   rot.m[2]=delta.right.z;   rot.m[3]=0.0f;
+            rot.m[4]=delta.up.x;      rot.m[5]=delta.up.y;      rot.m[6]=delta.up.z;      rot.m[7]=0.0f;
+            rot.m[8]=delta.forward.x; rot.m[9]=delta.forward.y; rot.m[10]=delta.forward.z;rot.m[11]=0.0f;
+            rot.m[12]=0.0f;           rot.m[13]=0.0f;           rot.m[14]=0.0f;           rot.m[15]=1.0f;
+            const Matrix4 out = MulRowVector(rot, g_dc_base);
+            if (SafeCopyOut(cam + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) g_dc_written = out;
+        }
+    }
+
+    {   // ~1/s heartbeat with GATE diagnostics (why apply_angle fails: rot mode / poslane / stale pose / non-angle +0x90)
+        static uint64_t sl = 0; const uint64_t now = NowMs();
+        if (now - sl >= 1000) { sl = now;
+            float p_s=0,p_u=0,p_f=0; Pose p_d{}; int p_e=0;
+            const bool poseOk = SnapshotOpenXrPose(p_s,p_u,p_f,p_d,p_e);
+            float a90=0,a94=0,a98=0; SafeRead(cam+0x90,a90); SafeRead(cam+0x94,a94); SafeRead(cam+0x98,a98);
+            spdlog::info("[FH5DATACAM] cam=0x{:X} applied(ang/fl/ypr)={}/{}/{} | rotMode={} poslane={} poseOk={} | cam90/94/98=({:.3f},{:.3f},{:.3f})",
+                         cam, angle_applied?1:0, fl_applied?1:0, ypr_applied?1:0,
+                         rotmode, fh5cb::ctl_pos_lane(), poseOk ? 1 : 0, a90, a94, a98);
+            // Read-only dump of the native cockpit free-look + CameraSpaceYPR lever fields, so we can SEE which
+            // are plausible angle fields on this retail camera object (small radians / a tag dword) vs garbage —
+            // this picks the working lever without a rebuild (just flip rot= in the ctl file).
+            uint32_t l540[4] = {0,0,0,0}; SafeCopyIn(cam + 0x540, l540, sizeof(l540));
+            float f544=0,f548=0,f54c=0;
+            std::memcpy(&f544,&l540[1],4); std::memcpy(&f548,&l540[2],4); std::memcpy(&f54c,&l540[3],4);
+            float a5C4=0,a5F4=0,a5F8=0; SafeRead(cam+0x5C4,a5C4); SafeRead(cam+0x5F4,a5F4); SafeRead(cam+0x5F8,a5F8);
+            spdlog::info("[FH5LEVER] cam=0x{:X} ypr540[tag=0x{:08X} f544={:.4f} f548={:.4f} f54c={:.4f}] freelook[5C4={:.4f} 5F4={:.4f} 5F8={:.4f}]",
+                         cam, l540[0], f544, f548, f54c, a5C4, a5F4, a5F8);
+        }
+    }
+}
+
 // Runtime camera-orientation probe. Called post-fold on the active CCamDriver. Two jobs:
 //  (1) dumpcam: scan the CCamDriver AND its nested view-source object (*(this+0x48)) for orthonormal 4x4s,
 //      logging each offset + its basisScore vs the live producer a4. The offset whose basisScore≈3 is the
@@ -3372,6 +3753,138 @@ bool apply_angle_head_rotation_prewrite(uintptr_t cam) {
         }
     }
     return true;
+}
+
+// Head Euler (RADIANS) from the published OpenXR head-delta basis (rows = right/up/forward). Identity basis ->
+// (0,0,0), so head-center is idempotent. Shared by the retail free-look / YPR levers below. Returns false if
+// there's no fresh VR head pose (engine then owns the angles) or the result isn't finite.
+static bool head_euler_radians(float& yaw, float& pitch, float& roll) {
+    float s = 0, u = 0, f = 0; Pose delta{}; int eye = 0;
+    if (!SnapshotOpenXrPose(s, u, f, delta, eye)) return false;
+    const Vec3 ff = delta.forward, rr = delta.right, uu = delta.up;
+    float fy = ff.y; if (fy > 1.0f) fy = 1.0f; if (fy < -1.0f) fy = -1.0f;
+    yaw   = std::atan2(ff.x, ff.z);   // around up
+    pitch = std::asin(fy);            // around right
+    roll  = std::atan2(rr.y, uu.y);   // around forward
+    return std::isfinite(yaw) && std::isfinite(pitch) && std::isfinite(roll);
+}
+
+// RETAIL 1.688 head-look lever A: the engine's NATIVE cockpit free-look angles. +0x5C4 (yaw) and +0x5F4
+// (pitch) are each clamped by the engine to ±0.785 rad (±45°) — confirming they're the look yaw/pitch; +0x5F8
+// is the adjacent roll float (CamDriverVtableOffsetDll probe, Empress). The engine consumes these during its
+// own per-frame camera build, so view + cull + cascades stay coherent (no late output-matrix clobber). We add
+// the head delta on top of the engine's resting base, anti-accumulate (refresh-detect a clean base), restore
+// on neutral, and per-field SKIP any field whose captured base isn't a plausible angle (never corrupt a
+// pointer/handle). Written from the worker; if async timing is clobbered the heartbeat shows base==written and
+// the view won't follow -> escalate to the cloned-vtable detour.
+static uintptr_t g_fl1688_obj = 0;
+static float     g_fl1688_base[3]    = { 0.0f, 0.0f, 0.0f };
+static float     g_fl1688_written[3] = { 0.0f, 0.0f, 0.0f };
+static bool      g_fl1688_have = false;
+static bool      g_fl1688_skip[3] = { false, false, false };
+
+bool apply_freelook_headlook_1688(uintptr_t cam) {
+    if (cam < 0x10000ull) return false;
+    if (fh5cb::ctl_rotation_mode() != 4) return false;
+
+    float yaw = 0, pitch = 0, roll = 0;
+    if (!head_euler_radians(yaw, pitch, roll)) return false;
+    const float head[3] = { yaw, pitch, roll };
+    const uintptr_t off[3] = { 0x5C4ull, 0x5F4ull, 0x5F8ull };
+    constexpr float kMaxSaneAngle = 6.5f;
+
+    float live[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3; ++i) {
+        if (!SafeRead(cam + off[i], live[i]) || !std::isfinite(live[i])) return false;
+    }
+    bool refreshed = (g_fl1688_obj != cam) || !g_fl1688_have;
+    if (!refreshed) {
+        for (int i = 0; i < 3; ++i)
+            if (std::fabs(live[i] - g_fl1688_written[i]) > 1e-4f) { refreshed = true; break; }
+    }
+    if (refreshed) {
+        g_fl1688_obj = cam; g_fl1688_have = true;
+        for (int i = 0; i < 3; ++i) {
+            g_fl1688_base[i] = live[i];
+            g_fl1688_skip[i] = std::fabs(live[i]) > kMaxSaneAngle;   // not a float angle -> never write it
+        }
+    }
+
+    const bool neutral = std::fabs(yaw) < 1e-5f && std::fabs(pitch) < 1e-5f && std::fabs(roll) < 1e-5f;
+    bool wrote = false;
+    for (int i = 0; i < 3; ++i) {
+        if (g_fl1688_skip[i]) continue;
+        const float v = neutral ? g_fl1688_base[i] : (g_fl1688_base[i] + head[i]);
+        if (std::isfinite(v) && SafeCopyOut(cam + off[i], &v, sizeof(v))) { g_fl1688_written[i] = v; wrote = true; }
+    }
+    {   // ~1/s
+        static uint64_t s_last = 0; const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5FREELK] cam=0x{:X} base(5C4,5F4,5F8)=({:.4f},{:.4f},{:.4f}) skip=({},{},{}) head(y,p,r)=({:.4f},{:.4f},{:.4f}) wrote={}",
+                         cam, g_fl1688_base[0], g_fl1688_base[1], g_fl1688_base[2],
+                         g_fl1688_skip[0]?1:0, g_fl1688_skip[1]?1:0, g_fl1688_skip[2]?1:0,
+                         yaw, pitch, roll, wrote?1:0);
+        }
+    }
+    return wrote && !neutral;
+}
+
+// RETAIL 1.688 head-look lever B: the +0x540 CameraSpaceYPR input lane (tag dword + 3 floats). This mirrors the
+// "head-tracking active" form the engine itself writes (sub_14084CC90 CameraSpaceYPRSet): tag=0 (explicitly
+// set/active), +0x544=pitch, +0x548=yaw, +0x54C=roll. The engine consumes it during the camera build, so the
+// view/cull/projection stay internally consistent. We capture the resting lane ONCE per object (the tuned
+// baseline head offset) and add the head delta on top; restore the raw base on neutral.
+static uintptr_t g_ypr540_obj = 0;
+static uint32_t  g_ypr540_base_raw[4] = { 0, 0, 0, 0 };
+static bool      g_ypr540_have = false;
+static bool      g_ypr540_applied = false;
+static float     ypr540_base_f(int i) { float v = 0.0f; std::memcpy(&v, &g_ypr540_base_raw[i], sizeof(v)); return v; }
+
+bool apply_ypr540_headlook_1688(uintptr_t cam) {
+    if (cam < 0x10000ull) return false;
+    if (fh5cb::ctl_rotation_mode() != 5) return false;
+
+    float yaw = 0, pitch = 0, roll = 0;
+    if (!head_euler_radians(yaw, pitch, roll)) return false;
+
+    if (g_ypr540_obj != cam || !g_ypr540_have) {
+        uint32_t raw[4] = { 0, 0, 0, 0 };
+        if (!SafeCopyIn(cam + 0x540, raw, sizeof(raw))) return false;
+        std::memcpy(g_ypr540_base_raw, raw, sizeof(raw));
+        g_ypr540_obj = cam; g_ypr540_have = true; g_ypr540_applied = false;
+    }
+
+    const bool neutral = std::fabs(yaw) < 1e-5f && std::fabs(pitch) < 1e-5f && std::fabs(roll) < 1e-5f;
+    if (neutral) {
+        if (g_ypr540_applied) {
+            SafeCopyOut(cam + 0x540, g_ypr540_base_raw, sizeof(g_ypr540_base_raw));
+            g_ypr540_applied = false;
+        }
+        return false;
+    }
+
+    const float f544 = ypr540_base_f(1) + pitch;
+    const float f548 = ypr540_base_f(2) + yaw;
+    const float f54c = ypr540_base_f(3) + roll;
+    if (!std::isfinite(f544) || !std::isfinite(f548) || !std::isfinite(f54c)) return false;
+    uint32_t lane[4];
+    lane[0] = 0u;   // tag: 0 == explicitly set / active
+    std::memcpy(&lane[1], &f544, sizeof(float));
+    std::memcpy(&lane[2], &f548, sizeof(float));
+    std::memcpy(&lane[3], &f54c, sizeof(float));
+    const bool wrote = SafeCopyOut(cam + 0x540, lane, sizeof(lane));
+    if (wrote) g_ypr540_applied = true;
+    {   // ~1/s
+        static uint64_t s_last = 0; const uint64_t now = NowMs();
+        if (now - s_last >= 1000) {
+            s_last = now;
+            spdlog::info("[FH5YPR540] cam=0x{:X} baseTag=0x{:08X} base=({:.4f},{:.4f},{:.4f}) head(y,p,r)=({:.4f},{:.4f},{:.4f}) out=({:.4f},{:.4f},{:.4f}) wrote={}",
+                         cam, g_ypr540_base_raw[0], ypr540_base_f(1), ypr540_base_f(2), ypr540_base_f(3),
+                         yaw, pitch, roll, f544, f548, f54c, wrote?1:0);
+        }
+    }
+    return wrote;
 }
 
 void on_input540_fold(uintptr_t object) {

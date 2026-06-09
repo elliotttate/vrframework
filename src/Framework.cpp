@@ -42,6 +42,29 @@ std::unique_ptr<Framework> g_framework{};
 
 namespace fs = std::filesystem;
 
+// EARLY SELF-ONLY crash logger (port diagnosis): logs the first few first-chance faults whose faulting RIP is
+// INSIDE this module (FH5VR.dll) to the log, with the module-relative RVA — so a crash in our own code during
+// init/first-frame on a new game build is pinpointed (resolve the RVA against FH5VR.pdb). SELF-ONLY: for any
+// fault outside our module it returns CONTINUE_SEARCH after a cheap range check, doing NO work — so it never
+// amplifies a de-DRM/driver exception storm (the documented Empress failure mode). Registered FIRST.
+static uintptr_t g_fwk_self_base = 0, g_fwk_self_end = 0;
+static LONG CALLBACK FwkCrashLogVeh(EXCEPTION_POINTERS* ep) {
+    if (ep == nullptr || ep->ExceptionRecord == nullptr || ep->ContextRecord == nullptr) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != 0xC0000005u && code != 0xC0000006u && code != 0xC00000FDu) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t rip = static_cast<uintptr_t>(ep->ContextRecord->Rip);
+    if (!g_fwk_self_base || rip < g_fwk_self_base || rip >= g_fwk_self_end) return EXCEPTION_CONTINUE_SEARCH; // self-only
+    static std::atomic<int> n{0};
+    const int i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 8) {
+        const uintptr_t fa = ep->ExceptionRecord->NumberParameters >= 2
+            ? static_cast<uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]) : 0;
+        spdlog::critical("[FWKVEH] #{} code=0x{:08X} rva=0x{:X} faultAddr=0x{:X}",
+                         i, static_cast<uint32_t>(code), rip - g_fwk_self_base, fa);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 Framework::Framework(HMODULE framework_module) {
     s_framework_module = framework_module;
 
@@ -56,6 +79,20 @@ Framework::Framework(HMODULE framework_module) {
         spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
     } catch (...) {
         // If the file can't be opened, fall through with the default (null) logger.
+    }
+
+    // Register the self-only crash logger FIRST (compute our module's image range so it can cheaply ignore
+    // non-FH5VR faults). Lets a crash in our own code during the retail-build bring-up be pinpointed in the log.
+    {
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&FwkCrashLogVeh), &self) && self != nullptr) {
+            g_fwk_self_base = reinterpret_cast<uintptr_t>(self);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(self);
+            auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(g_fwk_self_base + dos->e_lfanew);
+            g_fwk_self_end = g_fwk_self_base + nt->OptionalHeader.SizeOfImage;
+        }
+        AddVectoredExceptionHandler(1, FwkCrashLogVeh);
     }
 
     spdlog::info("vrframework entry");
@@ -459,7 +496,12 @@ void Framework::run_imgui_frame(bool from_present) {
         return;
     }
 
-    const bool is_init_ok = m_error.empty() && m_engine_ready;
+    const bool engine_ready = m_engine_ready.load(std::memory_order_acquire);
+    if (from_present && !engine_ready) {
+        return;
+    }
+
+    const bool is_init_ok = m_error.empty() && engine_ready;
 
     consume_input();
 
@@ -549,7 +591,7 @@ bool Framework::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_para
     }
 
     // Feed ImGui and arbitrate keyboard/mouse capture when the menu is open.
-    if (m_initialized && ImGui::GetCurrentContext() != nullptr) {
+    if (m_initialized && m_engine_ready.load(std::memory_order_acquire) && ImGui::GetCurrentContext() != nullptr) {
         ImGui_ImplWin32_WndProcHandler(wnd, message, w_param, l_param);
 
         const auto& io = ImGui::GetIO();

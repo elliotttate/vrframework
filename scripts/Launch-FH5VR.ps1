@@ -43,6 +43,8 @@ param(
     [string]$HudPremul = "on",   # quad source is premultiplied alpha (FH5 UI draws onto cleared-transparent RT)
     [ValidateSet("on","off")]
     [string]$HudFlipV = "on",    # flip quad V (SimXR preview's quad-layer V is inverted vs the projection layer)
+    [ValidateSet("on","off")]
+    [string]$BothEyes = "off",   # copy each fresh frame to BOTH eyes (mono). OFF: world keeps clean 1:1 alternate-eye stereo (verified) and the UI rides the mono quad. Only enable to force mono.
     [int]$UiRedirect = 18,       # 18 = pre-UI delta (clean eyes + HUD-delta quad, transition-safe). 0 = off.
     [ValidateSet("left","right")]
     [string]$HudPhase = "left",
@@ -86,7 +88,7 @@ if ($HudQuad -or $UiRedirect -ne 0) {
     # HUD composites over the clean eyes. -HudOpaque forces an opaque validation panel.
     $hudQuadValue = "on"
     $hudOpaqueValue = if ($HudOpaque) { "on" } else { "off" }
-    $control += "`nhudquad=$hudQuadValue`nhudopaque=$hudOpaqueValue`nhudpremul=$HudPremul`nhudflipv=$HudFlipV`nuiredirect=$UiRedirect`nhudphase=$HudPhase`nhudw=$HudW`nhudx=$HudX`nhudy=$HudY`nhudz=$HudZ"
+    $control += "`nhudquad=$hudQuadValue`nhudopaque=$hudOpaqueValue`nhudpremul=$HudPremul`nhudflipv=$HudFlipV`nbotheyes=$BothEyes`nuiredirect=$UiRedirect`nhudphase=$HudPhase`nhudw=$HudW`nhudx=$HudX`nhudy=$HudY`nhudz=$HudZ"
 }
 [System.IO.File]::WriteAllText($ControlPath, $control, [System.Text.Encoding]::ASCII)
 Write-Output "CONTROL $ControlPath ipd=$HalfIpdUnits scale=$WorldScale mode=off rot=$RotationPath proj=$projection poslane=$PosLane tgt=off hudquad=$($HudQuad.IsPresent) hudopaque=$(-not $HudTransparent.IsPresent) uiredirect=$UiRedirect hudphase=$HudPhase"

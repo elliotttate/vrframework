@@ -17,6 +17,10 @@ param(
     [string]$GameDir   = "E:\Games\ForzaHorizon5Empress",
     [string]$BuildDir  = "E:\Github\vrframework\build-fh5",
     [string]$Config    = "Release",
+    # Proxy DLL name (no extension). version.dll is imported by BOTH FH5 1.405 and retail 1.688 and, unlike
+    # dxgi.dll, is NOT interposed by NVIDIA Streamline (sl.interposer.dll, shipped in retail) -> avoids the
+    # double-wrap crash. The mod's actual hooking is via the D3D12 dummy-device vtable hook, not these exports.
+    [string]$ProxyName = "version",
     [string]$LoaderDll = "E:\Github\tapir-unreal-engine\Engine\Binaries\ThirdParty\OpenXR\win64\openxr_loader.dll",
     [string]$SimJson   = "E:\Github\OpenXR-Simulator\bin\openxr_simulator.json",
     [switch]$RealRuntime,
@@ -26,15 +30,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $exe       = Join-Path $GameDir "ForzaHorizon5.exe"
-$proxy     = Join-Path $GameDir "dxgi.dll"
-$realDxgi  = Join-Path $GameDir "dxgi_real.dll"
+$proxy     = Join-Path $GameDir "$ProxyName.dll"
+$realDll   = Join-Path $GameDir "${ProxyName}_real.dll"
+$sysSrc    = Join-Path $env:WINDIR "System32\$ProxyName.dll"
 $builtDll  = Join-Path $BuildDir "fh5vr\$Config\FH5VR.dll"
 
 if (-not (Test-Path $exe)) { throw "FH5 exe not found at $exe (pass -GameDir)" }
 
 if ($Undo) {
-    if (Test-Path $proxy)    { Remove-Item $proxy -Force; Write-Host "removed proxy dxgi.dll" }
-    if (Test-Path $realDxgi) { Move-Item $realDxgi $proxy -Force; Write-Host "restored dxgi_real.dll -> dxgi.dll" }
+    if (Test-Path $proxy)   { Remove-Item $proxy -Force; Write-Host "removed proxy $ProxyName.dll" }
+    if (Test-Path $realDll) { Move-Item $realDll $proxy -Force; Write-Host "restored ${ProxyName}_real.dll -> $ProxyName.dll" }
     Write-Host "undo complete."
     return
 }
@@ -43,15 +48,15 @@ if (-not (Test-Path $builtDll)) {
     throw "Built FH5VR.dll not found at $builtDll. Build first:`n  cmake --build $BuildDir --config $Config --target FH5VR"
 }
 
-# 1. Ensure dxgi_real.dll exists (the forward target). Prefer the game's own dxgi.dll; else System32.
-if (-not (Test-Path $realDxgi)) {
+# 1. Ensure <proxy>_real.dll exists (the forward target). Prefer the game's own copy; else System32.
+if (-not (Test-Path $realDll)) {
     if ((Test-Path $proxy) -and -not (Get-Item $proxy).VersionInfo.FileDescription) {
-        # An existing dxgi.dll that is NOT our proxy: promote it to the real forward target.
-        Move-Item $proxy $realDxgi -Force
-        Write-Host "moved existing dxgi.dll -> dxgi_real.dll"
+        # An existing proxy DLL that is NOT ours: promote it to the real forward target.
+        Move-Item $proxy $realDll -Force
+        Write-Host "moved existing $ProxyName.dll -> ${ProxyName}_real.dll"
     } else {
-        Copy-Item (Join-Path $env:WINDIR "System32\dxgi.dll") $realDxgi -Force
-        Write-Host "copied System32\dxgi.dll -> dxgi_real.dll"
+        Copy-Item $sysSrc $realDll -Force
+        Write-Host "copied System32\$ProxyName.dll -> ${ProxyName}_real.dll"
     }
 }
 

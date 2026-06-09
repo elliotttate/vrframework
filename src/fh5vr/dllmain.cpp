@@ -17,36 +17,52 @@
 #include <memory>
 
 #include "Framework.hpp"
+#include "Mods.hpp"          // complete type for unique_ptr<Mods> in Framework: dllmain owns g_framework
+                             // (std::make_unique<Framework>), so ~Framework -> ~unique_ptr<Mods> instantiates
+                             // here and needs Mods defined, not just the Framework.hpp forward declaration.
 #include "Fh5CameraCbuffer.hpp"
 #include "Fh5MenuNav.hpp"
 
-// --- dxgi.dll proxy export forwarding (-> dxgi_real.dll) --------------------------------------------
-// Same ordinal-stable set the probe uses; the renderer calls CreateDXGIFactory* which forward through.
-#pragma comment(linker, "/export:ApplyCompatResolutionQuirking=dxgi_real.ApplyCompatResolutionQuirking,@1")
-#pragma comment(linker, "/export:CompatString=dxgi_real.CompatString,@2")
-#pragma comment(linker, "/export:CompatValue=dxgi_real.CompatValue,@3")
-#pragma comment(linker, "/export:DXGIDumpJournal=dxgi_real.DXGIDumpJournal,@4")
-#pragma comment(linker, "/export:PIXBeginCapture=dxgi_real.PIXBeginCapture,@5")
-#pragma comment(linker, "/export:PIXEndCapture=dxgi_real.PIXEndCapture,@6")
-#pragma comment(linker, "/export:PIXGetCaptureState=dxgi_real.PIXGetCaptureState,@7")
-#pragma comment(linker, "/export:SetAppCompatStringPointer=dxgi_real.SetAppCompatStringPointer,@8")
-#pragma comment(linker, "/export:UpdateHMDEmulationStatus=dxgi_real.UpdateHMDEmulationStatus,@9")
-#pragma comment(linker, "/export:CreateDXGIFactory=dxgi_real.CreateDXGIFactory,@10")
-#pragma comment(linker, "/export:CreateDXGIFactory1=dxgi_real.CreateDXGIFactory1,@11")
-#pragma comment(linker, "/export:CreateDXGIFactory2=dxgi_real.CreateDXGIFactory2,@12")
-#pragma comment(linker, "/export:DXGID3D10CreateDevice=dxgi_real.DXGID3D10CreateDevice,@13")
-#pragma comment(linker, "/export:DXGID3D10CreateLayeredDevice=dxgi_real.DXGID3D10CreateLayeredDevice,@14")
-#pragma comment(linker, "/export:DXGID3D10GetLayeredDeviceSize=dxgi_real.DXGID3D10GetLayeredDeviceSize,@15")
-#pragma comment(linker, "/export:DXGID3D10RegisterLayers=dxgi_real.DXGID3D10RegisterLayers,@16")
-#pragma comment(linker, "/export:DXGIDeclareAdapterRemovalSupport=dxgi_real.DXGIDeclareAdapterRemovalSupport,@17")
-#pragma comment(linker, "/export:DXGIDisableVBlankVirtualization=dxgi_real.DXGIDisableVBlankVirtualization,@18")
-#pragma comment(linker, "/export:DXGIGetDebugInterface1=dxgi_real.DXGIGetDebugInterface1,@19")
-#pragma comment(linker, "/export:DXGIReportAdapterConfiguration=dxgi_real.DXGIReportAdapterConfiguration,@20")
+// --- version.dll proxy export forwarding (-> version_real.dll) --------------------------------------
+// PORT NOTE (retail Steam 1.688): we used to proxy dxgi.dll, but retail FH5 ships NVIDIA Streamline
+// (sl.interposer.dll) which ITSELF interposes DXGI and calls our dxgi proxy's CreateDXGIFactory1 — the
+// resulting double-wrap crashed in our forwarder during init. Proxying a DLL Streamline does NOT touch
+// (version.dll, imported by BOTH 1.405 and 1.688) decouples us from Streamline entirely; our actual D3D
+// hooking is done by the D3D12 dummy-device vtable hook (Framework), not by these exports — the proxy is
+// only a loader vehicle. Forwarders match System32\version.dll ordinals @1..@17.
+#pragma comment(linker, "/export:GetFileVersionInfoA=version_real.GetFileVersionInfoA,@1")
+#pragma comment(linker, "/export:GetFileVersionInfoByHandle=version_real.GetFileVersionInfoByHandle,@2")
+#pragma comment(linker, "/export:GetFileVersionInfoExA=version_real.GetFileVersionInfoExA,@3")
+#pragma comment(linker, "/export:GetFileVersionInfoExW=version_real.GetFileVersionInfoExW,@4")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeA=version_real.GetFileVersionInfoSizeA,@5")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeExA=version_real.GetFileVersionInfoSizeExA,@6")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeExW=version_real.GetFileVersionInfoSizeExW,@7")
+#pragma comment(linker, "/export:GetFileVersionInfoSizeW=version_real.GetFileVersionInfoSizeW,@8")
+#pragma comment(linker, "/export:GetFileVersionInfoW=version_real.GetFileVersionInfoW,@9")
+#pragma comment(linker, "/export:VerFindFileA=version_real.VerFindFileA,@10")
+#pragma comment(linker, "/export:VerFindFileW=version_real.VerFindFileW,@11")
+#pragma comment(linker, "/export:VerInstallFileA=version_real.VerInstallFileA,@12")
+#pragma comment(linker, "/export:VerInstallFileW=version_real.VerInstallFileW,@13")
+#pragma comment(linker, "/export:VerLanguageNameA=version_real.VerLanguageNameA,@14")
+#pragma comment(linker, "/export:VerLanguageNameW=version_real.VerLanguageNameW,@15")
+#pragma comment(linker, "/export:VerQueryValueA=version_real.VerQueryValueA,@16")
+#pragma comment(linker, "/export:VerQueryValueW=version_real.VerQueryValueW,@17")
 
 namespace {
 HMODULE g_module{};
 
 DWORD WINAPI bootstrap(void*) {
+    // INERT BISECT (FH5VR_DISABLE=1): load + forward version.dll exports but install NOTHING (no framework,
+    // no D3D12/present hook, no VR). Isolates whether retail FH5's GDK/anti-tamper exits because a foreign
+    // version.dll module is present (would still exit when inert) vs the mod's runtime hooking (would survive
+    // inert). The /export forwarders are static, so the proxy still chains to version_real either way.
+    {
+        char dis[8]{};
+        if (::GetEnvironmentVariableA("FH5VR_DISABLE", dis, sizeof(dis)) > 0 && dis[0] == '1') {
+            return 0;
+        }
+    }
+
     // Wait for the D3D12 runtime to be resident before standing up the framework. ForzaTech loads it
     // early, but the proxy can attach before it does; poll briefly (no app-dir search — system32 only).
     HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
@@ -63,7 +79,16 @@ DWORD WINAPI bootstrap(void*) {
     // Hook D3D12CreateDevice BEFORE the framework (and the game) create their devices, so the downstream
     // camera-cbuffer buffer-tracking hooks install at device creation and catch the camera ring's
     // allocation (it is created during render init, before any later producer-triggered install).
-    fh5cb::install_createdevice_hook(d3d12);
+    // BISECT (FH5VR_NO_CB=1): skip the fh5cb D3D12 device-vtable buffer-tracking hooks (committed/placed/
+    // CBV/SRV/UAV/RTV/CopyDescriptors/pso). Isolates whether retail's ~28s exit is tripped by the many DEVICE
+    // vtable modifications (would survive without them) vs the framework's single swapchain present hook.
+    {
+        char nocb[8]{};
+        const bool no_cb = ::GetEnvironmentVariableA("FH5VR_NO_CB", nocb, sizeof(nocb)) > 0 && nocb[0] == '1';
+        if (!no_cb) {
+            fh5cb::install_createdevice_hook(d3d12);
+        }
+    }
 
     // Install the XInput detour early so the menu navigator can inject controller input during the
     // title/menu flow — before the engine seam (and Fh5MenuNav::start) come up. Idempotent; start() retries.

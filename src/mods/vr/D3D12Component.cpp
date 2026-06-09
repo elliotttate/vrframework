@@ -256,7 +256,7 @@ float4 PSMain(VSOut i) : SV_Target {
     float2 uv = FlipUV(i.uv);
     float4 c = g_src.SampleLevel(g_samp, uv, 0.0);
     float alpha = saturate((max(max(c.r, c.g), c.b) - 0.01) * 12.0);
-    return float4(c.rgb, alpha);
+    return float4(c.rgb * alpha, alpha);
 }
 
 float4 PSDiff(VSOut i) : SV_Target {
@@ -268,7 +268,7 @@ float4 PSDiff(VSOut i) : SV_Target {
     float3 rgb = saturate(final_color.rgb * mask + delta * 3.0);
     float visible = max(max(rgb.r, rgb.g), rgb.b);
     float alpha = saturate(max(mask * 3.0, (visible - 0.01) * 4.0));
-    return float4(rgb, alpha);
+    return float4(rgb * alpha, alpha);
 }
 )";
 
@@ -862,13 +862,20 @@ float4 PSDiff(VSOut i) : SV_Target {
         allocator->Reset();
         cmd_list->Reset(allocator.Get(), pso_diff.Get());
 
-        static std::atomic<bool> s_diff_dump_written{false};
+        // Re-armable one-shot dump: fires on the first valid frame (seq 0 != initial -1) AND whenever huddump=N
+        // increments in the control file -> lets me grab a fresh GAMEPLAY capture (base/final/diff) instead of
+        // only the loading-phase first frame. Writes 3 BMPs: _base (the pre-UI snapshot the eyes use), _final
+        // (the live backbuffer), _diff (the amplified subtraction shown on the quad).
+        static std::atomic<int> s_diff_dump_done_seq{-1};
         bool dump_this_frame = false;
-        bool dump_expected = false;
-        if ((dst_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || dst_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-             dst_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || dst_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
-            s_diff_dump_written.compare_exchange_strong(dump_expected, true, std::memory_order_relaxed)) {
-            dump_this_frame = true;
+        const int dump_seq = fh5cb::ctl_hud_dump_seq();
+        if (dst_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || dst_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+            dst_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || dst_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            int prev = s_diff_dump_done_seq.load(std::memory_order_relaxed);
+            if (prev != dump_seq &&
+                s_diff_dump_done_seq.compare_exchange_strong(prev, dump_seq, std::memory_order_relaxed)) {
+                dump_this_frame = true;
+            }
         }
 
         ComPtr<ID3D12Resource> dump_readback{};
@@ -895,6 +902,30 @@ float4 PSDiff(VSOut i) : SV_Target {
                 spdlog::warn("[VR-HUDDIFF] readback buffer create failed: 0x{:08X}", (uint32_t)rb_hr);
                 dump_this_frame = false;
             }
+        }
+
+        // GROUND TRUTH: also read back `final` (live backbuffer) and `base` (pre-UI snapshot) as separate BMPs so
+        // I can see whether base is clean-world (delta viable) or already has the HUD. Both are in
+        // PIXEL_SHADER_RESOURCE at the copy point (transitioned for the SRVs below).
+        ComPtr<ID3D12Resource> dump_final_readback{};
+        ComPtr<ID3D12Resource> dump_base_readback{};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT dump_final_footprint{}, dump_base_footprint{};
+        UINT64 dump_final_total = 0, dump_base_total = 0;
+        if (dump_this_frame) {
+            UINT rows = 0; UINT64 rb = 0;
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            auto make_rb = [&](const D3D12_RESOURCE_DESC& src_desc, D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp,
+                               UINT64& total, ComPtr<ID3D12Resource>& out) {
+                device->GetCopyableFootprints(&src_desc, 0, 1, 0, &fp, &rows, &rb, &total);
+                D3D12_RESOURCE_DESC rbd{};
+                rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rbd.Width = total; rbd.Height = 1; rbd.DepthOrArraySize = 1; rbd.MipLevels = 1;
+                rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rbd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out));
+            };
+            make_rb(final_desc, dump_final_footprint, dump_final_total, dump_final_readback);
+            make_rb(base_desc,  dump_base_footprint,  dump_base_total,  dump_base_readback);
         }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC final_srv_desc{};
@@ -996,6 +1027,31 @@ float4 PSDiff(VSOut i) : SV_Target {
             cmd_list->ResourceBarrier(1, &dst_barrier);
         }
 
+        // Read back final + base (still PIXEL_SHADER_RESOURCE here) into their own buffers, same submission, so I
+        // can SEE whether base is clean-world or already HUD-merged.
+        if (dump_this_frame && dump_final_readback != nullptr && dump_base_readback != nullptr) {
+            auto copy_src = [&](ID3D12Resource* src, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp,
+                                ID3D12Resource* rb) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = src;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                cmd_list->ResourceBarrier(1, &b);
+                D3D12_TEXTURE_COPY_LOCATION s{}; s.pResource = src;
+                s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION d{}; d.pResource = rb;
+                d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; d.PlacedFootprint = fp;
+                cmd_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                cmd_list->ResourceBarrier(1, &b);
+            };
+            copy_src(final_src, dump_final_footprint, dump_final_readback.Get());
+            if (base_src != final_src) copy_src(base_src, dump_base_footprint, dump_base_readback.Get());
+        }
+
         D3D12_RESOURCE_BARRIER restore[2]{};
         UINT nr = 0;
         if (transition_final) {
@@ -1050,6 +1106,30 @@ float4 PSDiff(VSOut i) : SV_Target {
             } else {
                 spdlog::warn("[VR-HUDDIFF] readback map failed: 0x{:08X}", (uint32_t)map_hr);
             }
+
+            // Save final + base as separate images (the ground truth: is base clean-world or HUD-merged?).
+            auto save_rb = [&](ID3D12Resource* rb, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp,
+                               const D3D12_RESOURCE_DESC& desc, UINT64 total, const char* path) {
+                if (rb == nullptr) return;
+                void* m = nullptr;
+                D3D12_RANGE r{0, (SIZE_T)total};
+                if (SUCCEEDED(rb->Map(0, &r, &m)) && m != nullptr) {
+                    DumpStats st{};
+                    const bool ok = save_texture_bmp(path, static_cast<const uint8_t*>(m),
+                        (uint32_t)desc.Width, (uint32_t)desc.Height,
+                        fp.Footprint.RowPitch, desc.Format, &st);
+                    D3D12_RANGE e{0, 0};
+                    rb->Unmap(0, &e);
+                    spdlog::info("[VR-HUDDIFF] wrote {} ok={} nonzero={} maxByte={} fmt={}",
+                        path, ok, st.nonzero_bytes, (uint32_t)st.max_byte, (int)desc.Format);
+                } else {
+                    spdlog::warn("[VR-HUDDIFF] readback map failed for {}", path);
+                }
+            };
+            save_rb(dump_final_readback.Get(), dump_final_footprint, final_desc, dump_final_total,
+                    "E:\\tmp\\fh5_hudquad_final.bmp");
+            save_rb(dump_base_readback.Get(), dump_base_footprint, base_desc, dump_base_total,
+                    "E:\\tmp\\fh5_hudquad_base.bmp");
         }
 
         static std::atomic<uint64_t> s_last_log_ms{0};
@@ -1333,12 +1413,20 @@ bool D3D12Component::on_frame(VR* vr) {
 
     m_openxr.copy(vr, applied_eye, projection_src, device, command_queue, 0, projection_src_state);
 
+    // botheyes: also copy this freshly-rendered frame to the OTHER eye swapchain, so neither eye goes stale.
+    // FH5's per-eye AFR is heavily imbalanced (the producer stamps eye 0 ~5x more than eye 1), so the unfed eye
+    // holds an old image and the stereo pair flickers. Pushing the current frame to both eyes yields a steady
+    // mono image (correct for per-eye-identical menus/UI; trades the already-broken stereo for no flicker).
+    if (fh5cb::ctl_both_eyes()) {
+        m_openxr.copy(vr, 1 - applied_eye, projection_src, device, command_queue, 0, projection_src_state);
+    }
+
     if (phase_locked_hud && fh5cb::ctl_hud_quad() && applied_eye == hud_phase && applied_eye != 1) {
         uint32_t mw = 0, mh = 0, mf = 0;
         D3D12_RESOURCE_STATES source_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         ID3D12Resource* source = nullptr;
         if (ui_redirect_mode == 24) {
-            if (ID3D12Resource* pre_ui = fh5cb::pre_ui_eye_candidate_for(eye_texture, &mw, &mh, &mf)) {
+            if (ID3D12Resource* pre_ui = fh5cb::pre_ui_eye_candidate_for(eye_texture, &mw, &mh, &mf, 33 /*this-frame only: stale base => garbage world-residual delta*/)) {
                 const bool copied = m_openxr.copy_hud_delta(vr, eye_texture, pre_ui, device, command_queue,
                                                             D3D12_RESOURCE_STATE_PRESENT,
                                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1501,31 +1589,41 @@ bool D3D12Component::on_frame(VR* vr) {
             }
         } else if (ui_redirect_mode == 10 || ui_redirect_mode == 18 || ui_redirect_mode == 24) {
             uint32_t mw = 0, mh = 0, mf = 0;
-            if (ID3D12Resource* pre_ui = fh5cb::pre_ui_eye_candidate_for(eye_texture, &mw, &mh, &mf)) {
+            // FLICKER-FREE dual-snapshot: same-frame (post-UI world+UI = final) and (pre-UI clean world = base),
+            // both GPU-ordered snapshots of the SAME backbuffer captured on the game's command list. The world
+            // cancels exactly => delta = clean UI, no rotating-world residual (the old flicker from a live
+            // backbuffer read paired with a stale snapshot). Both are PIXEL_SHADER_RESOURCE.
+            const uint64_t want_frame = fh5cb::present_frame();
+            if (ID3D12Resource* base = fh5cb::pre_ui_base_frame_matched(eye_texture, want_frame, &mw, &mh, &mf)) {
+                // base = THIS frame's clean-world snapshot of eye_texture; final = the LIVE backbuffer (same frame,
+                // already world+UI). Same backbuffer + same frame => world cancels => clean UI, no residual flicker.
                 hud_src = eye_texture;
                 hud_src_state = D3D12_RESOURCE_STATE_PRESENT;
-                hud_delta_base = pre_ui;
+                hud_delta_base = base;
                 hud_delta = true;
-                static std::atomic<uint64_t> s_preui_src_log_ms{0};
+                static std::atomic<uint64_t> s_fm_src_log_ms{0};
                 const uint64_t now_ms = ::GetTickCount64();
-                uint64_t last_ms = s_preui_src_log_ms.load(std::memory_order_relaxed);
+                uint64_t last_ms = s_fm_src_log_ms.load(std::memory_order_relaxed);
                 if (now_ms - last_ms >= 2000 &&
-                    s_preui_src_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
-                    spdlog::info("[VR-HUDQUAD] using pre-UI delta source final=0x{:X} base=0x{:X}[{}x{} f{}]",
-                        reinterpret_cast<uintptr_t>(eye_texture), reinterpret_cast<uintptr_t>(pre_ui), mw, mh, mf);
+                    s_fm_src_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+                    spdlog::info("[VR-HUDQUAD] using FRAME-MATCHED delta final(live)=0x{:X} base=0x{:X}[{}x{} f{}] frame={}",
+                        reinterpret_cast<uintptr_t>(eye_texture), reinterpret_cast<uintptr_t>(base), mw, mh, mf, want_frame);
                 }
             } else {
+                // base for THIS frame's eye_texture not captured (composite missed this frame / off-phase): HOLD the
+                // last good HUD rather than subtract a stale base (= the world-residual flicker). hold-last keeps the quad up.
                 if (phase_locked_hud && applied_eye != hud_phase && m_openxr.hud_layer_ready) {
                     hud_source_ready = true;
                 } else {
                     hud_source_ready = false;
                 }
-                static std::atomic<uint64_t> s_preui_wait_log_ms{0};
+                static std::atomic<uint64_t> s_fm_wait_log_ms{0};
                 const uint64_t now_ms = ::GetTickCount64();
-                uint64_t last_ms = s_preui_wait_log_ms.load(std::memory_order_relaxed);
+                uint64_t last_ms = s_fm_wait_log_ms.load(std::memory_order_relaxed);
                 if (!hud_source_ready && now_ms - last_ms >= 2000 &&
-                    s_preui_wait_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
-                    spdlog::info("[VR-HUDQUAD] waiting for pre-UI delta source (mode {})", ui_redirect_mode);
+                    s_fm_wait_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+                    spdlog::info("[VR-HUDQUAD] waiting for FRAME-MATCHED pre-UI base (mode {}) frame={} — see [FH5PREUI]",
+                        ui_redirect_mode, want_frame);
                 }
             }
         } else if (ui_redirect_mode == 9) {
@@ -1668,8 +1766,8 @@ bool D3D12Component::on_frame(VR* vr) {
             }
         }
         bool hud_copied = false;
-        if (fh5cb::ctl_hud_quad() && hud_source_ready) {
-            const bool refresh_this_phase = !phase_locked_hud || applied_eye == hud_phase;
+        if (fh5cb::ctl_hud_quad()) {
+            const bool refresh_this_phase = hud_source_ready && (!phase_locked_hud || applied_eye == hud_phase);
             if (refresh_this_phase) {
                 hud_copied = hud_delta
                     ? m_openxr.copy_hud_delta(vr, hud_src, hud_delta_base, device, command_queue,
@@ -1679,14 +1777,20 @@ bool D3D12Component::on_frame(VR* vr) {
                     m_openxr.hud_layer_ready = true;
                     m_openxr.hud_layer_phase = applied_eye;
                 }
-            } else if (phase_locked_hud && m_openxr.hud_layer_ready) {
+            }
+            // HOLD-LAST: if no fresh HUD image was produced this present (source momentarily unavailable this
+            // frame, off AER phase, or the copy failed), REUSE the last good one so the quad stays in EVERY
+            // frame's layer list. Without this the quad drops out of frames where the per-present delta source
+            // isn't ready and the drawn HUD blinks on/off. The quad references the last released swapchain image,
+            // so reuse is free. Only kicks in once we've copied at least one good HUD image (hud_layer_ready).
+            if (!hud_copied && m_openxr.hud_layer_ready) {
                 hud_copied = true;
-                static std::atomic<uint64_t> s_phase_reuse_log_ms{0};
+                static std::atomic<uint64_t> s_hud_reuse_log_ms{0};
                 const uint64_t now_ms = ::GetTickCount64();
-                uint64_t last_ms = s_phase_reuse_log_ms.load(std::memory_order_relaxed);
+                uint64_t last_ms = s_hud_reuse_log_ms.load(std::memory_order_relaxed);
                 if (now_ms - last_ms >= 2000 &&
-                    s_phase_reuse_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
-                    spdlog::info("[VR-HUDQUAD] reusing phase-locked HUD image phase={} submitEye={}",
+                    s_hud_reuse_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+                    spdlog::info("[VR-HUDQUAD] hold-last HUD image (no fresh source this present) phase={} submitEye={}",
                         m_openxr.hud_layer_phase, applied_eye);
                 }
             }
@@ -1778,7 +1882,11 @@ void D3D12Component::on_reset(VR* vr) {
         copier.reset();
     }
 
+    fh5cb::invalidate_backbuffer_resources();
     m_prev_backbuffer.Reset();
+    m_backbuffer_size[0] = 0;
+    m_backbuffer_size[1] = 0;
+    m_force_reset = true;
 
     auto runtime = vr->get_runtime();
     if (runtime != nullptr && runtime->is_openxr() && runtime->loaded) {
@@ -1789,12 +1897,7 @@ void D3D12Component::on_reset(VR* vr) {
             vr->m_openxr->needs_pose_update = true;
         }
 
-        // Recreate swapchains if the HMD render size changed.
-        if (m_openxr.last_resolution[0] != vr->get_hmd_width() ||
-            m_openxr.last_resolution[1] != vr->get_hmd_height() ||
-            m_openxr.contexts.empty()) {
-            m_openxr.create_swapchains(vr);
-        }
+        m_openxr.destroy_swapchains(vr);
     }
 }
 
@@ -2025,7 +2128,7 @@ std::optional<std::string> D3D12Component::OpenXR::create_hud_swapchain(VR* vr, 
 void D3D12Component::OpenXR::destroy_swapchains(VR* vr) {
     std::scoped_lock _{this->mtx};
 
-    if (this->contexts.empty()) {
+    if (this->contexts.empty() && this->hud_handle == XR_NULL_HANDLE) {
         return;
     }
 
@@ -2055,6 +2158,7 @@ void D3D12Component::OpenXR::destroy_swapchains(VR* vr) {
     }
 
     this->contexts.clear();
+    this->last_resolution = {};
     if (openxr != nullptr) {
         openxr->swapchains.clear();
     }
@@ -2140,6 +2244,12 @@ void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource
     result = xrWaitSwapchainImage(swapchain.handle, &wait_info);
     if (result != XR_SUCCESS) {
         spdlog::error("[VR] xrWaitSwapchainImage failed: {}", openxr->get_result_string(result));
+        XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const auto release_result = xrReleaseSwapchainImage(swapchain.handle, &release_info);
+        if (release_result != XR_SUCCESS) {
+            spdlog::error("[VR] xrReleaseSwapchainImage after failed wait failed: {}", openxr->get_result_string(release_result));
+        }
+        ctx.num_textures_acquired--;
         return;
     }
 
@@ -2166,6 +2276,7 @@ void D3D12Component::OpenXR::copy(VR* vr, uint32_t swapchain_idx, ID3D12Resource
 
     if (result != XR_SUCCESS) {
         spdlog::error("[VR] xrReleaseSwapchainImage failed: {}", openxr->get_result_string(result));
+        ctx.num_textures_acquired--;
         return;
     }
 
@@ -2218,6 +2329,11 @@ bool D3D12Component::OpenXR::copy_hud(VR* vr, ID3D12Resource* src, ID3D12Device*
     result = xrWaitSwapchainImage(this->hud_handle, &wait_info);
     if (result != XR_SUCCESS) {
         spdlog::error("[VR] HUD xrWaitSwapchainImage failed: {}", openxr->get_result_string(result));
+        XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const auto release_result = xrReleaseSwapchainImage(this->hud_handle, &release_info);
+        if (release_result != XR_SUCCESS) {
+            spdlog::error("[VR] HUD xrReleaseSwapchainImage after failed wait failed: {}", openxr->get_result_string(release_result));
+        }
         return false;
     }
 
@@ -2278,6 +2394,11 @@ bool D3D12Component::OpenXR::copy_hud_delta(VR* vr, ID3D12Resource* final_src, I
     result = xrWaitSwapchainImage(this->hud_handle, &wait_info);
     if (result != XR_SUCCESS) {
         spdlog::error("[VR] HUD delta xrWaitSwapchainImage failed: {}", openxr->get_result_string(result));
+        XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const auto release_result = xrReleaseSwapchainImage(this->hud_handle, &release_info);
+        if (release_result != XR_SUCCESS) {
+            spdlog::error("[VR] HUD delta xrReleaseSwapchainImage after failed wait failed: {}", openxr->get_result_string(release_result));
+        }
         return false;
     }
 

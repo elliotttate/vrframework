@@ -39,4 +39,12 @@ if(MSVC)
         "/DELAYLOAD:d3d11.dll"
         "/DELAYLOAD:d3d12.dll")
     target_link_libraries(FH5VR PRIVATE delayimp)
+
+    # Emit a PDB even in Release (keep /O2 codegen via /OPT:REF,ICF) so crash offsets are symbolizable during
+    # the retail (1.688) port. Without this, Application-Error fault offsets in dxgi.dll can't be mapped to source.
+    target_compile_options(FH5VR PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(FH5VR PRIVATE
+        "$<$<CONFIG:Release>:/DEBUG>"
+        "$<$<CONFIG:Release>:/OPT:REF>"
+        "$<$<CONFIG:Release>:/OPT:ICF>")
 endif()

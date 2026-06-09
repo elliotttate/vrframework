@@ -750,26 +750,449 @@ static bool ReadPtrSEH(uintptr_t addr, uintptr_t& out) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-bool Fh5Adapter::install_hooks() {
-    // sub_140BB1EE0 prologue (Empress RVA 0xBB1EE0). Scan-or-fallback so a single binary serves the build.
-    const uintptr_t addr = memory::FuncRelocation(
-        "fh5_view_projection_producer",
-        "44 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 18 D9 FF FF B8 E8",
-        /*fallback RVA*/ 0xBB1EE0);   // FuncRelocation adds module_base() itself; pass the RVA, not absolute
+// ---------------------------------------------------------------------------
+// EXIT TRACE — locate retail FH5's integrity-check exit.
+//
+// Retail 1.688 cleanly terminates the process ~26-30s after launch whenever ANY of the mod's hooks are live
+// (bisect: inert survives; any D3D hook -> exit; Empress de-DRM has no such check). To find the check we hook
+// every process-termination entry point (TerminateProcess / RtlExitUserProcess / NtTerminateProcess) and log
+// the captured call stack resolved to ForzaHorizon5.exe+RVA when the exit fires. The RVA of the caller frame
+// in the exe is the integrity-check function -> decompile (1.688 dump) -> patch it out. We let the original
+// run (so we still get the log on the first pass); a later build can block/patch once the site is known.
+// ---------------------------------------------------------------------------
+using TerminateProcessFn  = BOOL(WINAPI*)(HANDLE, UINT);
+using RtlExitUserProcFn   = void(WINAPI*)(UINT);
+using NtTerminateProcFn   = LONG(WINAPI*)(HANDLE, LONG);
+static std::unique_ptr<FunctionHook> g_termproc_hook, g_rtlexit_hook, g_ntterm_hook;
+static std::atomic<bool> g_exit_logged{ false };
 
-    if (addr == 0) {
+static void log_exit_stack(const char* who, unsigned code) {
+    // Only emit the first termination (the integrity exit); avoid recursing/spamming during real shutdown.
+    if (g_exit_logged.exchange(true)) return;
+    void* frames[48]{};
+    const USHORT n = ::CaptureStackBackTrace(0, 48, frames, nullptr);
+    const uintptr_t base = memory::module_base();
+    const uintptr_t end  = base + memory::module_size();
+    std::string s; s.reserve(1024);
+    for (USHORT i = 0; i < n; ++i) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(frames[i]);
+        char part[80]{};
+        if (a >= base && a < end) {
+            std::snprintf(part, sizeof(part), " exe+0x%llX", (unsigned long long)(a - base));
+        } else {
+            HMODULE m{}; char nm[40] = "?";
+            if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCSTR>(a), &m) && m) {
+                char path[MAX_PATH]{}; ::GetModuleFileNameA(m, path, MAX_PATH);
+                const char* bn = path; for (const char* p = path; *p; ++p) if (*p == '\\' || *p == '/') bn = p + 1;
+                std::snprintf(nm, sizeof(nm), "%s", bn);
+                std::snprintf(part, sizeof(part), " %s+0x%llX", nm, (unsigned long long)(a - reinterpret_cast<uintptr_t>(m)));
+            } else {
+                std::snprintf(part, sizeof(part), " 0x%llX", (unsigned long long)a);
+            }
+        }
+        s += part;
+    }
+    spdlog::warn("[FH5EXITTRACE] {} code={} (exeBase=0x{:X}) stack:{}", who, code, base, s);
+    spdlog::default_logger()->flush();
+}
+
+static BOOL WINAPI Hook_TerminateProcess(HANDLE proc, UINT code) {
+    log_exit_stack("TerminateProcess", code);
+    return g_termproc_hook->get_original<TerminateProcessFn>()(proc, code);
+}
+static void WINAPI Hook_RtlExitUserProcess(UINT code) {
+    log_exit_stack("RtlExitUserProcess", code);
+    g_rtlexit_hook->get_original<RtlExitUserProcFn>()(code);
+}
+static LONG WINAPI Hook_NtTerminateProcess(HANDLE proc, LONG status) {
+    // NtTerminateProcess(handle, status): handle==0 terminates other threads (pre-exit), handle==-1/self = full
+    // exit. Log both; the integrity check's stack is what we want.
+    log_exit_stack("NtTerminateProcess", (unsigned)status);
+    return g_ntterm_hook->get_original<NtTerminateProcFn>()(proc, status);
+}
+
+// Manual NtTerminateProcess hook — safetyhook HANGS relocating the syscall stub, and FH5's anti-tamper calls
+// NtTerminateProcess DIRECTLY (bypassing TerminateProcess/RtlExitUserProcess, which our hooks proved are not
+// used). We reconstruct the stub as a trampoline (mov r10,rcx; mov eax,SSN; syscall; ret) and patch the real
+// stub's first 14 bytes with an absolute `jmp [rip+0]` to our handler. Patches NTDLL (not FH5 .text), so FH5's
+// own code CRC cannot see it. The handler logs the caller stack (= the second integrity layer) then chains.
+static NtTerminateProcFn g_ntterm_orig = nullptr;
+static LONG WINAPI Hook_NtTerminateManual(HANDLE proc, LONG status) {
+    log_exit_stack("NtTerminateProcess(direct)", (unsigned)status);
+    return g_ntterm_orig ? g_ntterm_orig(proc, status) : 0;
+}
+static bool install_ntterm_manual() {
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return false;
+    auto target = reinterpret_cast<uint8_t*>(::GetProcAddress(ntdll, "NtTerminateProcess"));
+    if (!target) return false;
+    if (!(target[0] == 0x4C && target[1] == 0x8B && target[2] == 0xD1 && target[3] == 0xB8)) {
+        spdlog::warn("[FH5EXITTRACE] NtTerminateProcess stub unexpected: {:02X} {:02X} {:02X} {:02X}",
+                     target[0], target[1], target[2], target[3]);
         return false;
     }
+    const uint32_t ssn = *reinterpret_cast<const uint32_t*>(target + 4);
+    auto tramp = reinterpret_cast<uint8_t*>(::VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return false;
+    int o = 0;
+    tramp[o++] = 0x4C; tramp[o++] = 0x8B; tramp[o++] = 0xD1;                  // mov r10, rcx
+    tramp[o++] = 0xB8; *reinterpret_cast<uint32_t*>(tramp + o) = ssn; o += 4; // mov eax, SSN
+    tramp[o++] = 0x0F; tramp[o++] = 0x05;                                    // syscall
+    tramp[o++] = 0xC3;                                                       // ret
+    g_ntterm_orig = reinterpret_cast<NtTerminateProcFn>(tramp);
+    uint8_t patch[14];
+    patch[0] = 0xFF; patch[1] = 0x25; *reinterpret_cast<uint32_t*>(patch + 2) = 0;        // jmp [rip+0]
+    *reinterpret_cast<uint64_t*>(patch + 6) = reinterpret_cast<uint64_t>(&Hook_NtTerminateManual);
+    DWORD oldp = 0;
+    if (!::VirtualProtect(target, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldp)) return false;
+    std::memcpy(target, patch, sizeof(patch));
+    ::VirtualProtect(target, sizeof(patch), oldp, &oldp);
+    ::FlushInstructionCache(::GetCurrentProcess(), target, sizeof(patch));
+    return true;
+}
 
-    g_producer_hook = std::make_unique<FunctionHook>(Address{ addr }, &Hook_Producer);
-    const bool ok = g_producer_hook->create();
+static void flushlog() { if (auto l = spdlog::default_logger()) l->flush(); }
+
+static bool env_flag_is_one(const char* name) {
+    char value[8]{};
+    return ::GetEnvironmentVariableA(name, value, sizeof(value)) > 0 && value[0] == '1';
+}
+
+// ---------------------------------------------------------------------------
+// CRC BYPASS — neuter retail FH5's xxHash integrity check.
+//
+// Technique from the community Forza-Mods-AIO (Cheats/ForzaHorizon5/Bypass.cs). Retail 1.688 runs an xxHash
+// CRC of its own code via a function pointer in a table; when it sees our hooks it cleanly terminates the
+// process (~28s). We find that table via a fixed call-site signature, resolve the check slot (table+0x30),
+// and overwrite it with the address of a bare `ret` (C3) so the check becomes a no-op. FH5 ALSO has a
+// secondary check that the slot is intact, so a 10s "dance" thread briefly restores the original pointer (and
+// disables our hooks) inside the verification window, then re-applies the bypass. Empress has no such check.
+// ---------------------------------------------------------------------------
+static uintptr_t g_xxh_slot = 0;       // &table[0x30] — holds the integrity-check fn pointer
+static uintptr_t g_xxh_orig = 0;       // original check fn pointer
+static uintptr_t g_ret_gadget = 0;     // address of a `C3` (ret) inside the exe
+static unsigned char g_orig_fn_bytes[3]{};  // original prologue bytes of the check fn (for FN-patch restore)
+static std::atomic<bool> g_crc_active{ false };
+
+static bool write_ptr_protected(uintptr_t slot, uintptr_t value) {
+    __try {
+        DWORD oldp = 0;
+        if (!::VirtualProtect(reinterpret_cast<void*>(slot), sizeof(uintptr_t), PAGE_READWRITE, &oldp)) return false;
+        *reinterpret_cast<volatile uintptr_t*>(slot) = value;
+        ::VirtualProtect(reinterpret_cast<void*>(slot), sizeof(uintptr_t), oldp, &oldp);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Enable/disable the INLINE (safetyhook) hooks that patch FH5's .text — the only mod changes the xxHash CRC
+// of FH5's code can see. The present/device hooks are vtable hooks in D3D-runtime memory (not FH5 .text), so
+// they are left alone. Used by the dance to present clean code during FH5's integrity-verification window.
+static void set_text_hooks_enabled(bool en) {
+    auto toggle = [en](std::unique_ptr<FunctionHook>& h) {
+        if (h && h->raw()) { if (en) (void)h->raw()->enable(); else (void)h->raw()->disable(); }
+    };
+    toggle(g_posewriter_hook);
+    toggle(g_camdriver_hook);
+    toggle(g_bridge_hook);
+    toggle(g_input540_fold_hook);
+}
+
+// The 10s "dance" (Forza-Mods-AIO): keep the check redirected to `ret` MOST of the time (CRC no-ops, our
+// hooks hidden), but periodically restore the original pointer + un-patch our .text hooks for a short window
+// so FH5's secondary integrity-verification (which detects a redirected/altered check) sees an intact slot
+// AND clean code, then re-apply. Defeats the meta-check that otherwise terminates the process ~28s in.
+static DWORD WINAPI crc_dance_thread(void*) {
+    ::Sleep(6000);  // let the camera hooks finish installing + get ahead of the first meta-check
+    while (g_crc_active.load(std::memory_order_acquire)) {
+        set_text_hooks_enabled(false);              // un-patch FH5 .text
+        write_ptr_protected(g_xxh_slot, g_xxh_orig); // restore the genuine check pointer
+        ::Sleep(1500);                               // verification window
+        write_ptr_protected(g_xxh_slot, g_ret_gadget); // re-bypass
+        set_text_hooks_enabled(true);                // re-patch FH5 .text
+        ::Sleep(7000);
+    }
+    return 0;
+}
+
+// BISECT/FIX-probe (FH5VR_CAMHOOK_AUTOREMOVE=1): after a delay (default 12s, FH5VR_CAMHOOK_AUTOREMOVE_MS),
+// disable the inline .text camera hooks (restore clean FH5 code). Tests whether the integrity CRC catches a
+// patch only while PERSISTENT (survives after removal) vs instantly (exits anyway). If survival -> the
+// "capture-the-camera-then-remove-hooks" strategy is viable.
+static DWORD WINAPI camhook_autoremove_thread(void*) {
+    char ms[16]{}; ::GetEnvironmentVariableA("FH5VR_CAMHOOK_AUTOREMOVE_MS", ms, sizeof(ms));
+    const DWORD delay = ms[0] ? (DWORD)atoi(ms) : 12000;
+    ::Sleep(delay);
+    set_text_hooks_enabled(false);
+    spdlog::warn("[FH5] camera .text hooks AUTO-REMOVED after {}ms (anti-tamper evade probe)", delay); flushlog();
+    return 0;
+}
+
+static void install_crc_bypass() {
+    const uintptr_t base = memory::module_base();
+
+    // A bare `ret` gadget inside .text (ret + int3 padding is ubiquitous at function ends -> guaranteed exec).
+    auto ret = memory::scan("C3 CC CC CC");
+    if (!ret) ret = memory::scan("C3");
+    if (!ret) { spdlog::warn("[FH5CRC] no ret gadget found — skipping CRC bypass"); return; }
+    g_ret_gadget = *ret;
+
+    // Locate the integrity-check call site (Forza-Mods-AIO Bypass.cs signature).
+    const char* sig = "48 8B D9 48 8D 05 ? ? ? ? 48 89 01 E8 ? ? ? ? 48 8B CB 48 83 C4 20 5B E9";
+    auto call = memory::scan(sig);
+    if (!call) {
+        spdlog::warn("[FH5CRC] integrity-check signature NOT found (build differs?) — retail may still exit ~28s");
+        return;
+    }
+    const uintptr_t CallAddress = *call;
+
+    // CallAddress+0x3 = `lea rax,[rip+disp32]`; disp32 at +0x3 of the lea; rip = lea + 7.
+    const uintptr_t pLea = CallAddress + 0x3;
+    int32_t disp = 0;
+    __try { disp = *reinterpret_cast<const int32_t*>(pLea + 0x3); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { spdlog::error("[FH5CRC] lea disp read faulted"); return; }
+    const uintptr_t xxhCheckPfns = pLea + 0x7 + static_cast<intptr_t>(disp);
+    g_xxh_slot = xxhCheckPfns + 0x30;
+
+    __try { g_xxh_orig = *reinterpret_cast<const uintptr_t*>(g_xxh_slot); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { spdlog::error("[FH5CRC] slot read faulted @0x{:X}", g_xxh_slot); return; }
+
+    // Mode select (env FH5VR_CRC_MODE): "fn" (default) patches the check FUNCTION to return immediately while
+    // leaving the slot pointer intact -> a slot-pointer meta-check still passes. "slot" redirects the pointer
+    // to a ret + runs the dance (defeats a slot-pointer check only if its cadence is caught). Redirecting made
+    // FH5 exit SOONER (22s), so the meta-check is a fast pointer check -> "fn" is the better default.
+    char modebuf[8]{};
+    ::GetEnvironmentVariableA("FH5VR_CRC_MODE", modebuf, sizeof(modebuf));
+    const bool slot_mode = (modebuf[0] == 's');
+
+    bool ok = false;
+    if (slot_mode) {
+        ok = write_ptr_protected(g_xxh_slot, g_ret_gadget);
+        spdlog::warn("[FH5CRC] SLOT-redirect {}: callSite=exe+0x{:X} pfns=exe+0x{:X} slot=0x{:X} orig=exe+0x{:X} ret=exe+0x{:X}",
+                     ok ? "INSTALLED" : "FAILED", CallAddress - base, xxhCheckPfns - base, g_xxh_slot,
+                     (g_xxh_orig > base ? g_xxh_orig - base : 0), g_ret_gadget - base);
+        g_crc_active.store(ok, std::memory_order_release);
+        flushlog();
+        if (ok) { if (HANDLE t = ::CreateThread(nullptr, 0, &crc_dance_thread, nullptr, 0, nullptr)) ::CloseHandle(t);
+                  spdlog::warn("[FH5CRC] meta-check dance thread started"); flushlog(); }
+    } else {
+        // Patch the check fn prologue to `xor eax,eax; ret` (return 0). Slot stays = orig -> pointer meta-check
+        // passes; the check itself no-ops so it never CRCs our hooks. Save originals for a later restore-dance.
+        __try { std::memcpy(g_orig_fn_bytes, reinterpret_cast<const void*>(g_xxh_orig), sizeof(g_orig_fn_bytes)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { spdlog::error("[FH5CRC] fn read faulted @0x{:X}", g_xxh_orig); return; }
+        static const unsigned char kRet0[] = { 0x33, 0xC0, 0xC3 };   // xor eax,eax ; ret
+        __try {
+            DWORD oldp = 0;
+            if (::VirtualProtect(reinterpret_cast<void*>(g_xxh_orig), sizeof(kRet0), PAGE_EXECUTE_READWRITE, &oldp)) {
+                std::memcpy(reinterpret_cast<void*>(g_xxh_orig), kRet0, sizeof(kRet0));
+                ::VirtualProtect(reinterpret_cast<void*>(g_xxh_orig), sizeof(kRet0), oldp, &oldp);
+                ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(g_xxh_orig), sizeof(kRet0));
+                ok = true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+        g_crc_active.store(ok, std::memory_order_release);
+        spdlog::warn("[FH5CRC] FN-patch {}: callSite=exe+0x{:X} pfns=exe+0x{:X} slot=0x{:X}(intact) checkFn=exe+0x{:X}",
+                     ok ? "INSTALLED" : "FAILED", CallAddress - base, xxhCheckPfns - base, g_xxh_slot,
+                     (g_xxh_orig > base ? g_xxh_orig - base : 0));
+        flushlog();
+    }
+}
+
+static void install_exit_trace() {
+    spdlog::warn("[FH5EXITTRACE] install begin"); flushlog();
+    HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (k32) {
+        if (auto p = ::GetProcAddress(k32, "TerminateProcess")) {
+            spdlog::warn("[FH5EXITTRACE] hooking TerminateProcess @0x{:X}", (uintptr_t)p); flushlog();
+            g_termproc_hook = std::make_unique<FunctionHook>(Address{ (uintptr_t)p }, &Hook_TerminateProcess);
+            const bool ok = g_termproc_hook->create();
+            if (!ok) g_termproc_hook.reset();
+            spdlog::warn("[FH5EXITTRACE] TerminateProcess hook ok={}", ok); flushlog();
+        }
+    }
+    if (ntdll) {
+        if (auto p = ::GetProcAddress(ntdll, "RtlExitUserProcess")) {
+            spdlog::warn("[FH5EXITTRACE] hooking RtlExitUserProcess @0x{:X}", (uintptr_t)p); flushlog();
+            g_rtlexit_hook = std::make_unique<FunctionHook>(Address{ (uintptr_t)p }, &Hook_RtlExitUserProcess);
+            const bool ok = g_rtlexit_hook->create();
+            if (!ok) g_rtlexit_hook.reset();
+            spdlog::warn("[FH5EXITTRACE] RtlExitUserProcess hook ok={}", ok); flushlog();
+        }
+        // NtTerminateProcess via the MANUAL hook (safetyhook hangs on the syscall stub).
+        char skipnt[8]{};
+        const bool skip_nt = ::GetEnvironmentVariableA("FH5VR_NO_NTTERM_HOOK", skipnt, sizeof(skipnt)) > 0 && skipnt[0] == '1';
+        if (!skip_nt) {
+            spdlog::warn("[FH5EXITTRACE] installing manual NtTerminateProcess hook"); flushlog();
+            const bool ok = install_ntterm_manual();
+            spdlog::warn("[FH5EXITTRACE] NtTerminateProcess manual hook ok={}", ok); flushlog();
+        } else {
+            spdlog::warn("[FH5EXITTRACE] NtTerminateProcess hook SKIPPED (FH5VR_NO_NTTERM_HOOK=1)"); flushlog();
+        }
+    }
+    spdlog::warn("[FH5EXITTRACE] install done (term={} rtlexit={} ntterm={})",
+                 g_termproc_hook != nullptr, g_rtlexit_hook != nullptr, g_ntterm_hook != nullptr); flushlog();
+}
+
+// ---------------------------------------------------------------------------
+// Build discriminator + per-build offset table.
+//
+// EVERY camera RVA/AOB/vtable below was derived for FH5 1.405 (Empress, base 0x140000000). On retail Steam
+// 1.688 some functions moved (the +0x540 fold, the +0x320 pose-writer) while others stayed put (the +0x320
+// publisher, the ForzaMultiCam bridge), and the view/projection PRODUCER is not yet located. We fingerprint
+// the build by a unique function prologue and pick the matching RVA set; an RVA of 0 means "not available on
+// this build" -> that hook is skipped (the mod still loads + runs VR with whatever hooks ARE present). The
+// per-hook prologue byte arrays in install_hooks() are byte-IDENTICAL across 1.405/1.688 for every function
+// that moved (verified against the retail exe), so only the RVAs differ here. See: fh5-retail-steam-port.
+// ---------------------------------------------------------------------------
+namespace {
+enum class Fh5Build { Unknown, V1405_Empress, V1688_Retail };
+
+struct Fh5BuildOffsets {
+    Fh5Build    build = Fh5Build::Unknown;
+    const char* name  = "unknown";
+    // Function RVAs (base 0x140000000). 0 => skip that hook on this build.
+    uint32_t producer        = 0;  // view/projection producer (a4/a7/a15/a16) — 1.688: DEFERRED (not located)
+    uint32_t camdriver320    = 0;  // CCamDriver +0x320 publisher (sub_1406BE3A0)
+    uint32_t input540_fold   = 0;  // CCamDriver +0x540 additive fold
+    uint32_t posewriter      = 0;  // ★ per-frame +0x320 writer: head-look (rot=angle) + capture + camsrc xlate
+    uint32_t aim_getter      = 0;  // disabled-injection on 1.405 (runtime no-op); 0 => skip
+    uint32_t lerpcam         = 0;  // disabled-injection diagnostic; 0 => skip
+    uint32_t followcam       = 0;  // disabled-injection diagnostic; 0 => skip
+    uint32_t uir_vtbl_slot54 = 0;  // &UIRenderer::vftable[54] (HUD-quad UI-pass bracket)
+    uint32_t uir_vf54        = 0;  // expected UIRenderer::vf54 target
+    uint32_t overlay_vtbl    = 0;  // OverlayRenderer12 vtable (HUD-quad source path)
+    // The ForzaMultiCam bridge is resolved by AOB (identical prologue+body on both builds) -> no RVA here.
+};
+
+// 1.405 producer prologue @0xBB1EE0 — the distinguishing fingerprint: this function moved AND changed on
+// 1.688 (the 1.405 AOB misses), so its ABSENCE here means "not 1.405".
+const unsigned char kFp1405Producer[] = {
+    0x44,0x89,0x44,0x24,0x18, 0x48,0x89,0x54,0x24,0x10, 0x55,0x53,0x56,0x57,
+    0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57, 0x48,0x8D,0xAC,0x24,0x18,0xD9,0xFF,0xFF
+};
+// 1.688 pose-writer prologue @0xF75430 (byte-identical to 1.405 sub_1407A1AC0; verified in the retail exe).
+const unsigned char kFp1688PoseWriter[] = {
+    0x48,0x8B,0xC4, 0x48,0x89,0x58,0x08, 0x48,0x89,0x70,0x10, 0x48,0x89,0x78,0x18,
+    0x4C,0x89,0x70,0x20, 0x55, 0x48,0x8D,0x68,0xC8, 0x48,0x81,0xEC,0x30,0x01,0x00,0x00
+};
+} // namespace
+
+static const Fh5BuildOffsets& resolve_build_offsets() {
+    static const Fh5BuildOffsets table = [] {
+        Fh5BuildOffsets o{};
+        const uintptr_t base = memory::module_base();
+        // 1.405 (Empress) — fingerprint: producer prologue present at 0xBB1EE0.
+        if (BytesMatchSEH(base + 0xBB1EE0, kFp1405Producer, sizeof(kFp1405Producer))) {
+            o.build = Fh5Build::V1405_Empress; o.name = "1.405 (Empress de-DRM)";
+            o.producer        = 0xBB1EE0;
+            o.camdriver320    = 0x6BE3A0;
+            o.input540_fold   = 0x7A6300;
+            o.posewriter      = 0x7A1AC0;
+            o.aim_getter      = 0x7A9DD0;
+            o.lerpcam         = 0xC7F270;
+            o.followcam       = 0xDC9770;
+            o.uir_vtbl_slot54 = 0x5F8F648;
+            o.uir_vf54        = 0x181FCB0;
+            o.overlay_vtbl    = 0x5EB1CF0;
+            return o;
+        }
+        // 1.688 (retail Steam) — fingerprint: pose-writer prologue present at 0xF75430 (its 1.688 RVA).
+        if (BytesMatchSEH(base + 0xF75430, kFp1688PoseWriter, sizeof(kFp1688PoseWriter))) {
+            o.build = Fh5Build::V1688_Retail; o.name = "1.688 (retail Steam)";
+            o.producer        = 0;          // DEFERRED: prologue changed; 1.405 AOB misses. Head-look uses the
+                                            // pose-writer; translation view/cull + per-eye proj await the producer.
+            o.camdriver320    = 0x6BE3A0;   // SAME as 1.405 (prologue verified byte-identical)
+            o.input540_fold   = 0x54C9DC8;  // moved
+            o.posewriter      = 0xF75430;   // moved (★ the head-look + camera-capture hook)
+            // aim/lerp/follow injections are runtime no-ops even on 1.405 (diagnostics only) -> skip on 1.688.
+            // UI/overlay HUD-quad vtables not yet mapped on 1.688 -> defer (0).
+            return o;
+        }
+        return o;   // Unknown build
+    }();
+    return table;
+}
+
+bool Fh5Adapter::install_hooks() {
+    // Optional exit-trace (diagnostic only; hooking ntdll exit stubs during init can stall — opt-in). The CRC
+    // bypass (install_crc_bypass) is the real fix for retail's ~28s integrity exit, so this stays off by default.
+    if (env_flag_is_one("FH5VR_EXIT_TRACE")) {
+        install_exit_trace();
+    }
+
+    // CRC bypass (Forza-Mods-AIO technique) — OFF by default. It did NOT stop the retail ~28s exit (a separate
+    // check catches the camera hooks), and its fn-patch is ITSELF a .text modification that the real check
+    // would flag. The shipping retail strategy is the no-.text-hook DATA head-look (Tick1688DataHeadlook), so
+    // we install ZERO .text patches. Kept behind FH5VR_CRC_BYPASS for experimentation.
+    if (env_flag_is_one("FH5VR_CRC_BYPASS")) {
+        install_crc_bypass();
+    }
+
+    // ── BUILD DISCRIMINATOR (port guard) ─────────────────────────────────────────────────────────────────
+    // EVERY RVA/AOB/vtable below was derived for FH5 1.405 (Empress). On a DIFFERENT build these offsets point
+    // at unrelated code; installing inline safetyhooks at a mismatched RVA crashes (safetyhook disassembles
+    // garbage -> AV). resolve_build_offsets() fingerprints the build (1.405 producer @0xBB1EE0 vs 1.688
+    // pose-writer @0xF75430) and returns the matching RVA set, with 0 for any function not available on this
+    // build. On an UNRECOGNIZED build we skip all FH5 camera/VR hooks (D3D12 + OpenXR still init, so the mod
+    // loads stably and VR is simply inert). SEH-guarded reads => the fingerprint never faults itself.
+    const Fh5BuildOffsets& off = resolve_build_offsets();
+    if (off.build == Fh5Build::Unknown) {
+        spdlog::warn("[FH5] PORT GUARD: build fingerprint unrecognized (neither the 1.405 producer @0xBB1EE0 "
+                     "nor the 1.688 pose-writer @0xF75430 matched). SKIPPING all FH5 camera/VR hooks; D3D12 + "
+                     "OpenXR stay active so the mod loads but VR camera control is inert. Re-derive offsets.");
+        return true;
+    }
+    spdlog::info("[FH5] build detected: {} | producer={} camdriver320=0x{:X} fold=0x{:X} posewriter=0x{:X}",
+                 off.name, off.producer ? "present" : "DEFERRED",
+                 off.camdriver320, off.input540_fold, off.posewriter);
+
+    // Inline .text camera hooks (posewriter/camdriver/bridge/fold). On retail 1.688 these prologue patches are
+    // exactly what the integrity check CRCs and kills the process for (~28s) — bisect-proven. So on 1.688 we
+    // install NONE of them; head-look runs from the DATA worker path (Tick1688DataHeadlook: hook-free multicam
+    // scan + structural camera validation + +0x320 compose, all heap DATA the CRC can't see). Empress (1.405)
+    // keeps the inline hooks (no integrity check there). Overrides: FH5VR_NO_CAMHOOKS=1 forces skip on any
+    // build; FH5VR_FORCE_CAMHOOKS=1 forces install even on 1.688 (for A/B testing).
+    const bool skip_camhooks =
+        !env_flag_is_one("FH5VR_FORCE_CAMHOOKS") &&
+        (env_flag_is_one("FH5VR_NO_CAMHOOKS") || off.build == Fh5Build::V1688_Retail);
+    if (skip_camhooks) {
+        spdlog::warn("[FH5] inline .text camera hooks SKIPPED ({}) -> head-look via the DATA worker path "
+                     "(Tick1688DataHeadlook); zero .text patches so the retail integrity CRC stays clean",
+                     off.build == Fh5Build::V1688_Retail ? "retail 1.688 default" : "FH5VR_NO_CAMHOOKS");
+        return true;
+    }
+
+    // View/projection producer. On 1.405 this is the primary VR lever (a4 rotate + a15/a16 translate + a7
+    // proj). On builds where it is not yet located (producer==0, e.g. 1.688) we DEFER it: head-look comes from
+    // the pose-writer instead, and the eye-copy falls back to AFR parity, so VR still works (translation
+    // view/cull + per-eye projection are the only things gated on the producer). install_hooks() must NOT fail
+    // when the producer is deferred, or on_initialize() aborts the whole adapter — so ok starts true.
+    bool ok = true;
+    if (off.producer != 0) {
+        // sub_140BB1EE0 prologue. Scan-or-fallback so a single binary serves the build.
+        const uintptr_t addr = memory::FuncRelocation(
+            "fh5_view_projection_producer",
+            "44 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 18 D9 FF FF B8 E8",
+            /*fallback RVA*/ off.producer);   // FuncRelocation adds module_base() itself; pass the RVA
+        if (addr != 0) {
+            g_producer_hook = std::make_unique<FunctionHook>(Address{ addr }, &Hook_Producer);
+            ok = g_producer_hook->create();
+            spdlog::info("[FH5] view/projection producer hook {} @0x{:X}", ok ? "installed" : "create FAILED", addr);
+        } else {
+            spdlog::warn("[FH5] producer AOB/fallback unresolved; producer hook skipped");
+        }
+    } else {
+        spdlog::info("[FH5] view/projection producer DEFERRED on this build — head-look via the pose-writer; "
+                     "translation view/cull + per-eye projection unavailable until the producer is located.");
+    }
 
     // CCamDriver +0x320 publisher sub_1406BE3A0 (Empress RVA 0x6BE3A0; confirmed live in the .i64 by
     // fh5_empress_shadow_cascade_RE.md). The Release build's signature scan misses this .text region (the
     // producer only installed via its fallback RVA), so resolve by RVA + a prologue sanity-check. Defining
     // insn: `add rcx,0x320; mov rbx,rdx`. Hooking it lets us rotate the upstream pose so the shadow cascades
     // (which read +0x320, not a4) follow head-look.
-    const uintptr_t cd = memory::module_base() + 0x6BE3A0;
+    const uintptr_t cd = memory::module_base() + off.camdriver320;
     static const unsigned char kCamDriverPrologue[] = {
         0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x81,0xC1,0x20,0x03,0x00,0x00, 0x48,0x8B,0xDA
     };
@@ -800,7 +1223,7 @@ bool Fh5Adapter::install_hooks() {
     // a wrong target (build/base drift) would otherwise corrupt arbitrary code and crash. Prologue bytes are
     // from the Empress IDA RE (fh5_empress_camera_input_lanes_RE.md); the unique in-body anchor for scanners is
     // 0F 10 86 40 05 00 00 0F 58 86 30 05 00 00 at function+0x82 (movups xmm0,[r14+540h]; addps [r14+530h]).
-    const uintptr_t input540 = memory::module_base() + 0x7A6300;
+    const uintptr_t input540 = memory::module_base() + off.input540_fold;
     static const unsigned char kFoldPrologue[] = {
         0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x48,0x89,0x7C,0x24,0x18,
         0x41,0x56, 0x48,0x83,0xEC,0x50, 0x4C,0x8B,0xF1
@@ -822,12 +1245,12 @@ bool Fh5Adapter::install_hooks() {
     // Camera pose getter sub_1407A9DD0 (RVA 0x7A9DD0) — the per-frame look-at basis rebuild. Hooking its
     // entry lets us rotate the +0x540 look-direction so the main view AND shadow cascades follow head-look.
     // Raw-RVA target -> verify the prologue before inline-hooking (no ASLR; base 0x140000000).
-    const uintptr_t aim = memory::module_base() + 0x7A9DD0;
+    const uintptr_t aim = memory::module_base() + off.aim_getter;
     static const unsigned char kAimGetterPrologue[] = {
         0x48,0x8B,0xC4, 0x48,0x89,0x58,0x18, 0x48,0x89,0x70,0x20, 0x55,
         0x48,0x8D,0x68,0xA1, 0x48,0x81,0xEC,0xB0,0x00,0x00,0x00
     };
-    if (BytesMatchSEH(aim, kAimGetterPrologue, sizeof(kAimGetterPrologue))) {
+    if (off.aim_getter != 0 && BytesMatchSEH(aim, kAimGetterPrologue, sizeof(kAimGetterPrologue))) {
         g_aim_getter_hook = std::make_unique<FunctionHook>(Address{ aim }, &Hook_AimGetter);
         if (!g_aim_getter_hook->create()) {
             g_aim_getter_hook.reset();
@@ -835,6 +1258,8 @@ bool Fh5Adapter::install_hooks() {
         } else {
             spdlog::info("[FH5] camera pose getter hook installed @0x{:X} (prologue verified)", aim);
         }
+    } else if (off.aim_getter == 0) {
+        spdlog::info("[FH5] camera pose getter SKIPPED (deferred on this build; it is a runtime no-op anyway)");
     } else {
         spdlog::warn("[FH5] camera pose getter prologue MISMATCH at 0x{:X}; NOT hooking (build/base drift?)", aim);
     }
@@ -865,7 +1290,7 @@ bool Fh5Adapter::install_hooks() {
     // the render pass copies +0x320 into the producer a4 and fits the shadow cascades. It's the only +0x320
     // writer the bp caught for the active camera, and has a clean entry prologue. Rotate the active camera's
     // +0x320 POST-original here so a4 AND the cascades follow head-look.
-    const uintptr_t posewriter = memory::module_base() + 0x7A1AC0;
+    const uintptr_t posewriter = memory::module_base() + off.posewriter;
     static const unsigned char kPoseWriterPrologue[] = {
         0x48,0x8B,0xC4, 0x48,0x89,0x58,0x08, 0x48,0x89,0x70,0x10, 0x48,0x89,0x78,0x18,
         0x4C,0x89,0x70,0x20, 0x55, 0x48,0x8D,0x68,0xC8, 0x48,0x81,0xEC,0x30,0x01,0x00,0x00
@@ -885,23 +1310,31 @@ bool Fh5Adapter::install_hooks() {
     // UPSTREAM head-look lever: fh5_cam_LerpCameraStateStruct (RVA 0xC7F270, named in the decompile — a
     // verified function start, so no byte gate needed). Hooking it lets us add the head Euler to the camera
     // angle triple +0x90/0x94/0x98 upstream of the +0x320 build and (hopefully) the cull/cascade fit.
-    const uintptr_t lerpcam = memory::module_base() + 0xC7F270;
-    g_lerpcam_hook = std::make_unique<FunctionHook>(Address{ lerpcam }, &Hook_LerpCameraState);
-    if (!g_lerpcam_hook->create()) {
-        g_lerpcam_hook.reset();
-        spdlog::warn("[FH5] LerpCameraStateStruct hook create failed @0x{:X}", lerpcam);
+    if (off.lerpcam != 0) {
+        const uintptr_t lerpcam = memory::module_base() + off.lerpcam;
+        g_lerpcam_hook = std::make_unique<FunctionHook>(Address{ lerpcam }, &Hook_LerpCameraState);
+        if (!g_lerpcam_hook->create()) {
+            g_lerpcam_hook.reset();
+            spdlog::warn("[FH5] LerpCameraStateStruct hook create failed @0x{:X}", lerpcam);
+        } else {
+            spdlog::info("[FH5] LerpCameraStateStruct hook installed @0x{:X} (fh5_cam_LerpCameraStateStruct)", lerpcam);
+        }
     } else {
-        spdlog::info("[FH5] LerpCameraStateStruct hook installed @0x{:X} (fh5_cam_LerpCameraStateStruct)", lerpcam);
+        spdlog::info("[FH5] LerpCameraStateStruct hook SKIPPED (deferred on this build; injection is disabled anyway)");
     }
 
     // PER-FRAME camera-follow angle setter sub_140DC9770 (RVA 0xDC9770) — THE upstream injection point.
-    const uintptr_t followcam = memory::module_base() + 0xDC9770;
-    g_followcam_hook = std::make_unique<FunctionHook>(Address{ followcam }, &Hook_FollowCamAngles);
-    if (!g_followcam_hook->create()) {
-        g_followcam_hook.reset();
-        spdlog::warn("[FH5] follow-cam angle hook create failed @0x{:X}", followcam);
+    if (off.followcam != 0) {
+        const uintptr_t followcam = memory::module_base() + off.followcam;
+        g_followcam_hook = std::make_unique<FunctionHook>(Address{ followcam }, &Hook_FollowCamAngles);
+        if (!g_followcam_hook->create()) {
+            g_followcam_hook.reset();
+            spdlog::warn("[FH5] follow-cam angle hook create failed @0x{:X}", followcam);
+        } else {
+            spdlog::info("[FH5] follow-cam angle hook installed @0x{:X} (sub_140DC9770)", followcam);
+        }
     } else {
-        spdlog::info("[FH5] follow-cam angle hook installed @0x{:X} (sub_140DC9770)", followcam);
+        spdlog::info("[FH5] follow-cam angle hook SKIPPED (deferred on this build; injection is disabled anyway)");
     }
 
     // UIRenderer (D3D12UIRenderer) render-entry vf54 — a diagnostic UI-pass bracket. This path can be called
@@ -914,10 +1347,10 @@ bool Fh5Adapter::install_hooks() {
         // to disable. The redirect itself is still gated by uiredirect, so this is a no-op image-wise when off.
         char uirhk[8]{};
         const bool disabled = ::GetEnvironmentVariableA("FH5VR_UI_RENDERER_HOOK", uirhk, sizeof(uirhk)) > 0 && uirhk[0] == '0';
-        if (!disabled) {
+        if (!disabled && off.uir_vf54 != 0) {
             const uintptr_t base = memory::module_base();
-            const uintptr_t vtbl_slot54 = base + 0x5F8F648;   // &UIRenderer::vftable[54]
-            const uintptr_t expected    = base + 0x181FCB0;   // UIRenderer__vf54
+            const uintptr_t vtbl_slot54 = base + off.uir_vtbl_slot54;   // &UIRenderer::vftable[54]
+            const uintptr_t expected    = base + off.uir_vf54;          // UIRenderer__vf54
             uintptr_t slot = 0;
             if (ReadPtrSEH(vtbl_slot54, slot) && slot == expected) {
                 g_uir_render_hook = std::make_unique<FunctionHook>(Address{ slot }, &Hook_UIRendererRender);
@@ -930,6 +1363,8 @@ bool Fh5Adapter::install_hooks() {
             } else {
                 spdlog::warn("[FH5UIR] UIRenderer vf54 vtable mismatch (slot=0x{:X} expected=0x{:X}) — UI-pass bracket OFF; uiredirect=30 cannot catch UI", slot, expected);
             }
+        } else if (off.uir_vf54 == 0) {
+            spdlog::info("[FH5UIR] UIRenderer vf54 render-entry hook DEFERRED (HUD-quad vtables not mapped on this build)");
         } else {
             spdlog::info("[FH5UIR] UIRenderer vf54 render-entry hook DISABLED (FH5VR_UI_RENDERER_HOOK=0)");
         }
@@ -937,10 +1372,11 @@ bool Fh5Adapter::install_hooks() {
 
     // OverlayRenderer12 exact UI source path. The resource-binding hook is the complete capture point because
     // both sub_140E15C90 and the inline textured rectangle path update OverlayRendererPSParameters before this
-    // binding function resolves textureObject+0x10 to the SRV descriptor.
-    {
+    // binding function resolves textureObject+0x10 to the SRV descriptor. All RVAs here are 1.405-specific (the
+    // HUD-quad source path is not yet mapped on 1.688) -> gate on the per-build overlay vtable RVA.
+    if (off.overlay_vtbl != 0) {
         const uintptr_t base = memory::module_base();
-        const uintptr_t overlay_vtbl = base + 0x5EB1CF0; // vftbl_OverlayRenderer12
+        const uintptr_t overlay_vtbl = base + off.overlay_vtbl; // vftbl_OverlayRenderer12
         struct OverlaySlot { const char* name; uintptr_t slot_rva; uintptr_t fn_rva; std::unique_ptr<FunctionHook>* hook; void* detour; };
         OverlaySlot slots[] = {
             {"vf14", 14u * sizeof(uintptr_t), 0xDEE440, &g_overlay_vf14_hook, (void*)&Hook_OverlayVf14},
@@ -1016,6 +1452,12 @@ bool Fh5Adapter::install_hooks() {
         } else {
             spdlog::warn("[FH5OVERLAY] sub_140DF5910 immediate-flush prologue mismatch @0x{:X}; hook skipped", flush);
         }
+    } else {
+        spdlog::info("[FH5OVERLAY] OverlayRenderer12 HUD-quad source path DEFERRED (vtables not mapped on this build)");
+    }
+
+    if (env_flag_is_one("FH5VR_CAMHOOK_AUTOREMOVE")) {
+        if (HANDLE t = ::CreateThread(nullptr, 0, &camhook_autoremove_thread, nullptr, 0, nullptr)) ::CloseHandle(t);
     }
 
     return ok;
@@ -1136,11 +1578,10 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
         pos_lane != fh5cb::kPosLaneOff;
     const bool downstream_position = pos_lane == fh5cb::kPosLaneDownstream;
     const float* producer_delta = (rot_mode == 1) ? head_delta16 : identity16;
-    // driver_delta carries the head rotation for mode 2 (CCamDriver +0x320 matrix) AND mode 3 (cam+0x90
-    // Euler angles) — both consume the published delta basis via SnapshotOpenXrPose. The two appliers
-    // self-gate (apply_camdriver_head_rotation -> mode 2, apply_angle_head_rotation_prewrite -> mode 3), so
-    // only one acts; the producer a4 stays identity in both (the view rotates via the rebuilt +0x320/a4).
-    const float* driver_delta   = (rot_mode == 2 || rot_mode == 3) ? head_delta16 : identity16;
+    // driver_delta carries the head rotation for the data-worker rotation modes. The individual appliers
+    // self-gate on ctl_rotation_mode(), so this can publish the same head basis for all driver/data levers.
+    const float* driver_delta =
+        (rot_mode == 2 || rot_mode == 3 || rot_mode == 4 || rot_mode == 5) ? head_delta16 : identity16;
     std::memcpy(s.delta, producer_delta, sizeof(s.delta));
     const glm::vec3 head_right_axis{ head_delta16[0], head_delta16[1], head_delta16[2] };
     const glm::vec3 driver_off_full = s_head_off_driver + head_right_axis * half_ipd;
@@ -1203,9 +1644,17 @@ std::optional<std::string> Fh5Adapter::on_initialize() {
     // Signal the framework that the engine seam is live. This flips m_engine_ready, which gates
     // is_ready(), the d3d-thread init pass (VR::on_initialize_d3d_thread -> OpenXR bringup) and the
     // per-frame stereo path. Without it the mod hooks the camera but never runs VR. (Framework.cpp:378.)
-    if (g_framework != nullptr) {
+    // BISECT (FH5VR_NO_ENGINE=1): install all hooks but DO NOT engage VR (skip enable_engine_thread, so the
+    // present hook stays a passthrough — no eye-copy / OpenXR submit / present redirect). Isolates whether the
+    // ~28s retail exit is caused by the present/device hooks alone (would still exit) vs VR engagement (would
+    // survive). No-op for normal runs.
+    char noeng[8]{};
+    const bool no_engine = ::GetEnvironmentVariableA("FH5VR_NO_ENGINE", noeng, sizeof(noeng)) > 0 && noeng[0] == '1';
+    if (g_framework != nullptr && !no_engine) {
         g_framework->enable_engine_thread();
         spdlog::info("[FH5] engine seam live -> enable_engine_thread()");
+    } else if (no_engine) {
+        spdlog::warn("[FH5] FH5VR_NO_ENGINE=1 -> VR NOT engaged (present-hook passthrough bisect)");
     }
     // Start the UPSTREAM camera-pose writer (polls the active CCamDriver+0x320; gated to tgt=driver). This
     // is the proven lever that moves the rendered camera coherently (shadows/culling/chevrons follow).

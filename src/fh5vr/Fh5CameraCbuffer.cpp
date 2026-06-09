@@ -62,11 +62,13 @@ std::atomic<float> g_ctl_hud_y{ 0.0f };      // +y up
 std::atomic<float> g_ctl_hud_z{ -1.8f };     // -z forward (distance in front of the head)
 std::atomic<bool>  g_ctl_hud_premul{ true }; // hudpremul=on -> treat the quad source as PREMULTIPLIED alpha (default: FH5 UI draws onto a cleared-transparent RT => premult). off -> straight/unpremultiplied (sets XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
 std::atomic<bool>  g_ctl_hud_flipv{ false }; // hudflipv=on -> flip the quad source vertically in the HUD blit. Default off (OpenXR-spec convention). Turn on for runtimes whose quad-layer V convention is inverted vs the projection layer (e.g. the SimXR preview shows the HUD V-flipped).
+std::atomic<bool>  g_ctl_both_eyes{ false }; // botheyes=on -> copy the freshly-rendered frame to BOTH eye swapchains every present (mono presentation). Kills the stale-right-eye flicker caused by FH5's imbalanced per-eye AFR (producer stamps eye 0 ~5x more than eye 1); correct for mono content (menus/UI). Off = native per-eye stereo.
 std::atomic<int>   g_ctl_ui_redirect{ 0 };     // uiredirect: 0=off 1=redirect 2=dry run 3=R10A2 probe 4=skip composite-SRV source 5=skip UI PSOs 6=skip latest UI-lineage origin 7=mirror UI PSOs 8=mirror UI PSOs without replay 9=direct HUD atlas source 10=pre-UI/final delta quad 11=OverlayRenderer12 descriptor source 12=mirror whole atlas+replay 13=mirror atlas+skip UI PSO replay 14=mirror atlas+clear native 15=mirror atlas+skip final native sampler 16=broad lineage capture 17=broad final mirror+skip 18=pre-UI projection + delta quad 19=pre-UI projection + overlay RT quad 20=phase-locked final mirror+skip 21=phase-locked final sample, no native suppression 22=phase-locked HUD atlas, no native suppression 23=phase-locked UI PSO mirror, no native suppression 24=phase-locked pre-UI delta quad 25=phase-locked pre-UI projection + late final mirror+replay 26=phase-locked UI PSO mirror+skip native 27=phase-locked pre-UI projection + overlay RT steal 28=full-size final UI/flush steal 29=OverlayRenderer12 native target 30=engine-seam steal via the vf54 UIRenderer bracket (RECOMMENDED: in_ui_scope full-screen UI draws -> UI RT, no replay -> HUD-only quad + clean eyes)
 std::atomic<int>   g_ctl_hud_phase{ 0 };       // hudphase=left/right (0/1): AER phase used to refresh the HUD quad texture in phase-locked HUD modes
 std::atomic<int>   g_ctl_hud_plane{ -1 };    // hudplane=N -> which ALLOW_DISPLAY HUD plane to show on the quad (-1=auto/last)
 std::atomic<int>   g_ctl_src_root{ 0 };       // srcroot/srcslot: composite SRV descriptor to source-skip in uiredirect=4
 std::atomic<int>   g_ctl_src_slot{ -1 };
+std::atomic<int>   g_ctl_hud_dump_seq{ 0 };   // huddump=N -> re-arm the HUD-quad base/final/diff one-shot dump (write an increasing N to grab a fresh capture during gameplay, not just the loading-phase first frame)
 
 // UPSTREAM camera-translation test: a constant camera-relative offset applied IN THE PRODUCER to a chosen
 // argument, to find which lever actually moves the rendered camera (with shadows/derived data following).
@@ -93,11 +95,13 @@ void poll_control_file() {
             g_ctl_mode.store(iv, std::memory_order_relaxed);
         }
         else if (strncmp(line, "rot=", 4) == 0) {
-            if      (strncmp(line + 4, "off", 3)    == 0) iv = 0;
-            else if (strncmp(line + 4, "a4", 2)     == 0) iv = 1;
-            else if (strncmp(line + 4, "driver", 6) == 0) iv = 2;
-            else if (strncmp(line + 4, "angle", 5)  == 0) iv = 3;   // inject head Euler at cam+0x90/94/98 (upstream of view+cull+shadow)
-            else                                          iv = 2;
+            if      (strncmp(line + 4, "off", 3)      == 0) iv = 0;
+            else if (strncmp(line + 4, "a4", 2)       == 0) iv = 1;
+            else if (strncmp(line + 4, "driver", 6)   == 0) iv = 2;
+            else if (strncmp(line + 4, "angle", 5)    == 0) iv = 3;   // inject head Euler at cam+0x90/94/98 (upstream of view+cull+shadow)
+            else if (strncmp(line + 4, "freelook", 8) == 0) iv = 4;   // RETAIL 1.688: write native cockpit free-look angles +0x5C4/+0x5F4/+0x5F8
+            else if (strncmp(line + 4, "ypr540", 6)   == 0) iv = 5;   // RETAIL 1.688: write the +0x540 CameraSpaceYPR input lane
+            else                                            iv = 2;
             g_ctl_rot_mode.store(iv, std::memory_order_relaxed);
         }
         else if (strncmp(line, "proj=", 5) == 0) {
@@ -134,6 +138,13 @@ void poll_control_file() {
                 strncmp(line + 9, "1", 1) == 0 ||
                 strncmp(line + 9, "true", 4) == 0;
             g_ctl_hud_flipv.store(enabled, std::memory_order_relaxed);
+        }
+        else if (strncmp(line, "botheyes=", 9) == 0) {
+            const bool enabled =
+                strncmp(line + 9, "on", 2) == 0 ||
+                strncmp(line + 9, "1", 1) == 0 ||
+                strncmp(line + 9, "true", 4) == 0;
+            g_ctl_both_eyes.store(enabled, std::memory_order_relaxed);
         }
         else if (strncmp(line, "uiredirect=", 11) == 0) {
             int m = 0;
@@ -192,6 +203,7 @@ void poll_control_file() {
         else if (sscanf_s(line, "hudplane=%d", &iv) == 1) g_ctl_hud_plane.store(iv, std::memory_order_relaxed);
         else if (sscanf_s(line, "srcroot=%d", &iv) == 1)  g_ctl_src_root.store(iv, std::memory_order_relaxed);
         else if (sscanf_s(line, "srcslot=%d", &iv) == 1)  g_ctl_src_slot.store(iv, std::memory_order_relaxed);
+        else if (sscanf_s(line, "huddump=%d", &iv) == 1)  g_ctl_hud_dump_seq.store(iv, std::memory_order_relaxed);
         else if (sscanf_s(line, "hudw=%f", &v) == 1)    g_ctl_hud_w.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "hudx=%f", &v) == 1)    g_ctl_hud_x.store(v, std::memory_order_relaxed);
         else if (sscanf_s(line, "hudy=%f", &v) == 1)    g_ctl_hud_y.store(v, std::memory_order_relaxed);
@@ -1446,13 +1458,25 @@ std::atomic<uint64_t>        g_preui_eye_latest_frame{ 0 };
 constexpr int                kPreUiEyeCopySlots = 8;
 struct PreUiEyeCopySlot {
     ID3D12Resource* src{ nullptr };
-    ID3D12Resource* copy{ nullptr };
+    ID3D12Resource* copy{ nullptr };       // pre-UI snapshot (clean world) — captured @ composite, eye projection source
+    ID3D12Resource* post_copy{ nullptr };  // post-UI snapshot (world+UI) — captured @ leave_ui_pass, same backbuffer/frame
     uint64_t meta{ 0 };
     std::atomic<uint32_t> state{ D3D12_RESOURCE_STATE_COPY_DEST };
+    std::atomic<uint32_t> post_state{ D3D12_RESOURCE_STATE_COPY_DEST };
     std::atomic<uint64_t> seen_ms{ 0 };
+    std::atomic<uint64_t> post_seen_ms{ 0 };
+    std::atomic<uint64_t> pre_frame{ 0 };  // g_present_frame at the pre-UI capture
+    std::atomic<uint64_t> post_frame{ 0 }; // g_present_frame at the post-UI capture; delta only when pre_frame==post_frame
 };
 PreUiEyeCopySlot             g_preui_eye_slots[kPreUiEyeCopySlots];
+// Per-present frame counter (bumped once per present in ui_redirect_on_present). The pre-UI snapshot (@composite)
+// and the post-UI snapshot (@leave_ui_pass) of the SAME backbuffer both stamp the counter value live during that
+// frame; the HUD delta uses a slot's (pre,post) copies only when their stamps match => guaranteed same-frame pair
+// => the world cancels exactly => delta = clean UI (no rotating-world residual = the old flicker).
+std::atomic<uint64_t>        g_present_frame{ 0 };
+std::atomic<ID3D12Resource*> g_preui_eye_latest_src{ nullptr };  // backbuffer the latest pre-UI snapshot was taken of (this frame)
 std::atomic<uint32_t>        g_dbg_preui_captures{ 0 };
+std::atomic<uint32_t>        g_dbg_postui_captures{ 0 };
 std::atomic<uint32_t>        g_dbg_preui_recreated{ 0 };
 std::atomic<uint32_t>        g_dbg_preui_failed{ 0 };
 std::atomic<uint32_t>        g_dbg_overlay_rt_draws{ 0 };
@@ -1522,15 +1546,24 @@ void ReleasePreUiEyeCopyLocked() {
     g_preui_eye_latest.store(nullptr, std::memory_order_relaxed);
     g_preui_eye_latest_meta.store(0, std::memory_order_relaxed);
     g_preui_eye_latest_frame.store(0, std::memory_order_relaxed);
+    g_preui_eye_latest_src.store(nullptr, std::memory_order_relaxed);
     for (auto& slot : g_preui_eye_slots) {
         if (slot.copy != nullptr) {
             slot.copy->Release();
             slot.copy = nullptr;
         }
+        if (slot.post_copy != nullptr) {
+            slot.post_copy->Release();
+            slot.post_copy = nullptr;
+        }
         slot.src = nullptr;
         slot.meta = 0;
         slot.state.store(D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_relaxed);
+        slot.post_state.store(D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_relaxed);
         slot.seen_ms.store(0, std::memory_order_relaxed);
+        slot.post_seen_ms.store(0, std::memory_order_relaxed);
+        slot.pre_frame.store(0, std::memory_order_relaxed);
+        slot.post_frame.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -1684,6 +1717,9 @@ bool MarkEyeFirstSeen(ID3D12Resource* res) {  // returns true if this is the FIR
 // draw on this thread is part of the AVUI pass -> redirect it (engine-level, scene-independent signal).
 thread_local int      t_ui_pass_depth = 0;
 std::atomic<int>      g_ui_pass_depth{ 0 };     // vf54 can enqueue worker-thread command recording; expose it globally too.
+// The command list recording UI draws into the backbuffer this frame (captured in BeginDrawRedirect while in the
+// vf54 bracket). leave_ui_pass records the POST-UI backbuffer snapshot onto it (same thread => same open list).
+thread_local ID3D12GraphicsCommandList* t_ui_cmdlist = nullptr;
 
 // CASE A (live free-roam): vf54 renders the UI into an OFF-SCREEN RT (the UIRenderer's own *(this+64)),
 // NOT the backbuffer (uiDraws=0 with the bb_bound gate). So instead of "redirect backbuffer draws", we
@@ -1750,10 +1786,18 @@ void ReleasePreUiEyeSlotLocked(PreUiEyeCopySlot& slot) {
         slot.copy->Release();
         slot.copy = nullptr;
     }
+    if (slot.post_copy != nullptr) {
+        slot.post_copy->Release();
+        slot.post_copy = nullptr;
+    }
     slot.src = nullptr;
     slot.meta = 0;
     slot.state.store(D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_relaxed);
+    slot.post_state.store(D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_relaxed);
     slot.seen_ms.store(0, std::memory_order_relaxed);
+    slot.post_seen_ms.store(0, std::memory_order_relaxed);
+    slot.pre_frame.store(0, std::memory_order_relaxed);
+    slot.post_frame.store(0, std::memory_order_relaxed);
 }
 
 PreUiEyeCopySlot* EnsurePreUiEyeCopySlot(ID3D12Resource* src, uint64_t meta) {
@@ -1881,13 +1925,102 @@ void CapturePreUiEyeAfterComposite(ID3D12GraphicsCommandList* self, ID3D12Resour
         const uint64_t now_ms = GetTickCount64();
         slot->state.store(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, std::memory_order_release);
         slot->seen_ms.store(now_ms, std::memory_order_relaxed);
+        slot->pre_frame.store(g_present_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
         g_preui_eye_latest.store(dst, std::memory_order_release);
         g_preui_eye_latest_meta.store(meta, std::memory_order_relaxed);
         g_preui_eye_latest_frame.store(now_ms, std::memory_order_relaxed);
+        g_preui_eye_latest_src.store(src, std::memory_order_release);   // backbuffer this frame's clean-world snapshot is OF; leave_ui_pass snapshots its POST-UI state
         g_dbg_preui_captures.fetch_add(1, std::memory_order_relaxed);
     }
 
     g_preui_eye_recording.clear(std::memory_order_release);
+}
+
+// POST-UI snapshot: copy the SAME backbuffer the pre-UI (clean-world) snapshot was taken of THIS frame, now that
+// the UI has been drawn into it, onto the GAME's command list at leave_ui_pass. Pairing the two GPU-ordered
+// snapshots (pre=clean world, post=world+UI) of the SAME backbuffer in the SAME frame means the world cancels
+// exactly in the delta => clean UI, no rotating-world residual (the flicker). Mirrors the pre-UI capture's barriers.
+std::atomic_flag g_postui_eye_recording = ATOMIC_FLAG_INIT;
+void CapturePostUiEyeOnList(ID3D12GraphicsCommandList* self) {
+    if (!self) return;
+    ID3D12Resource* src = g_preui_eye_latest_src.load(std::memory_order_acquire);
+    if (!src) return;
+    if (g_postui_eye_recording.test_and_set(std::memory_order_acquire)) return;
+
+    PreUiEyeCopySlot* slot = nullptr;
+    ID3D12Resource* dst = nullptr;
+    uint64_t meta = 0;
+    {
+        std::scoped_lock lk(g_preui_eye_mtx);
+        for (auto& s : g_preui_eye_slots) {
+            if (s.src == src && s.copy != nullptr) { slot = &s; meta = s.meta; break; }
+        }
+        if (slot != nullptr) {
+            if (slot->post_copy == nullptr) {
+                // lazily clone a post-UI copy with the same desc as the pre-UI copy
+                ID3D12Device* device = g_uir_device.load(std::memory_order_acquire);
+                if (device != nullptr && slot->copy != nullptr) {
+                    D3D12_RESOURCE_DESC rd = slot->copy->GetDesc();
+                    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+                    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    ID3D12Resource* pc = nullptr;
+                    if (SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pc))) && pc) {
+                        pc->SetName(L"FH5VR post-UI eye copy");
+                        slot->post_copy = pc;
+                        slot->post_state.store(D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_relaxed);
+                    }
+                }
+            }
+            dst = slot->post_copy;
+        }
+    }
+    if (slot != nullptr && dst != nullptr) {
+        const auto dst_before = (D3D12_RESOURCE_STATES)slot->post_state.exchange(
+            D3D12_RESOURCE_STATE_COPY_DEST, std::memory_order_acq_rel);
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        UINT nb = 0;
+        if (dst_before != D3D12_RESOURCE_STATE_COPY_DEST) {
+            barriers[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[nb].Transition.pResource = dst;
+            barriers[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barriers[nb].Transition.StateBefore = dst_before;
+            barriers[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            ++nb;
+        }
+        barriers[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[nb].Transition.pResource = src;
+        barriers[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[nb].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;  // backbuffer is RT mid-frame (UI just drawn)
+        barriers[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        ++nb;
+        self->ResourceBarrier(nb, barriers);
+
+        D3D12_TEXTURE_COPY_LOCATION d{}; d.pResource = dst;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; d.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION s{}; s.pResource = src;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+        self->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+
+        D3D12_RESOURCE_BARRIER restore[2]{};
+        restore[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore[0].Transition.pResource = src;
+        restore[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        restore[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        restore[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore[1].Transition.pResource = dst;
+        restore[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        restore[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        self->ResourceBarrier(2, restore);
+
+        slot->post_state.store(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, std::memory_order_release);
+        slot->post_seen_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        slot->post_frame.store(slot->pre_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_dbg_postui_captures.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_postui_eye_recording.clear(std::memory_order_release);
 }
 
 // DIAGNOSTIC: tally draws per bound RT resource (any thread) so we can identify the engine's UI render
@@ -3113,6 +3246,15 @@ RedirectScope BeginDrawRedirect(ID3D12GraphicsCommandList* self, UINT drawSize) 
     if (is_bbfs)   g_dbg_bbfs.fetch_add(1, std::memory_order_relaxed);
     if (is_eyesrc) g_dbg_eyesrc.fetch_add(1, std::memory_order_relaxed);
 
+    // DUAL-SNAPSHOT (modes 10/18/24): remember the command list that has the eye-source/backbuffer bound as a
+    // RENDER_TARGET this frame. leave_ui_pass records the POST-UI backbuffer snapshot onto it (the list is still
+    // open and the backbuffer is RT, so the RT->COPY_SOURCE->RT barriers are valid). The composite draw always
+    // sets this; later eye-source draws (the in-place HUD) refine it to the last one. Same recording thread as
+    // leave_ui_pass => the thread-local handle is the right list.
+    if (is_eyesrc && (mode == 10 || mode == 18 || mode == 24)) {
+        t_ui_cmdlist = self;
+    }
+
     // GATE: a draw matters if its RT is a full-screen display-format buffer (the HUD's intermediate, computed
     // lock-free at bind time) OR the registered eye-source. All hot-path lookups here are LOCK-FREE -- the
     // global std::mutexes that used to guard these were what deadlocked against the game's render sync.
@@ -3252,6 +3394,79 @@ void ReleaseUiRedirectRt() {
     ClearUirFullTargets();
 }
 
+void invalidate_backbuffer_resources() {
+    ReleaseUiRedirectRt();
+    ReleaseUiMirrors();
+    ReleasePreUiEyeCopy();
+    ClearUirFullTargets();
+
+    g_composite_target.store(nullptr, std::memory_order_relaxed);
+    for (int i = 0; i < kMaxEyeSrc; ++i) {
+        g_eye_src_lf[i].store(nullptr, std::memory_order_relaxed);
+    }
+    g_eye_src_n.store(0, std::memory_order_release);
+    {
+        std::scoped_lock lk(g_eye_seen_mtx);
+        g_eye_first_seen.clear();
+    }
+    {
+        std::scoped_lock lk(g_uir_cap_mtx);
+        g_uir_cap_counts.clear();
+        g_uir_target_res = nullptr;
+        g_uir_target_count.store(0, std::memory_order_relaxed);
+    }
+    {
+        std::scoped_lock lk(g_rt_mtx);
+        g_rt_tally.clear();
+    }
+
+    g_hud_layer.store(nullptr, std::memory_order_relaxed);
+    g_ui_atlas_latest.store(nullptr, std::memory_order_relaxed);
+    g_ui_atlas_latest_meta.store(0, std::memory_order_relaxed);
+    g_ui_atlas_latest_ms.store(0, std::memory_order_relaxed);
+
+    g_dbg_last_copysrc.store(nullptr, std::memory_order_relaxed);
+    g_dbg_last_copydst.store(nullptr, std::memory_order_relaxed);
+    g_uil_last_copy_src.store(nullptr, std::memory_order_relaxed);
+    g_uil_last_copy_dst.store(nullptr, std::memory_order_relaxed);
+    g_uil_candidate.store(nullptr, std::memory_order_relaxed);
+    g_uil_candidate_origin.store(nullptr, std::memory_order_relaxed);
+    g_uil_candidate_meta.store(0, std::memory_order_relaxed);
+    g_uil_candidate_frame.store(0, std::memory_order_relaxed);
+    g_uil_candidate_root_slot.store(0, std::memory_order_relaxed);
+    g_uil_candidate_depth.store(0, std::memory_order_relaxed);
+    g_uil_latest_sample.store(nullptr, std::memory_order_relaxed);
+    g_uil_latest_origin.store(nullptr, std::memory_order_relaxed);
+    g_srcskip_target.store(nullptr, std::memory_order_relaxed);
+
+    g_uifinal_latest_sample.store(nullptr, std::memory_order_relaxed);
+    g_uifinal_latest_origin.store(nullptr, std::memory_order_relaxed);
+    g_uifinal_latest_rt.store(nullptr, std::memory_order_relaxed);
+    g_uifinal_mirror_latest.store(nullptr, std::memory_order_relaxed);
+
+    g_overlay_srv_latest.store(nullptr, std::memory_order_relaxed);
+    g_overlay_srv_latest_meta.store(0, std::memory_order_relaxed);
+    g_overlay_srv_latest_cpu.store(0, std::memory_order_relaxed);
+    g_overlay_srv_latest_ms.store(0, std::memory_order_relaxed);
+    g_overlay_latest_renderer.store(0, std::memory_order_relaxed);
+    g_overlay_latest_ps.store(0, std::memory_order_relaxed);
+    g_overlay_latest_tex.store(0, std::memory_order_relaxed);
+    g_overlay_latest_desc.store(0, std::memory_order_relaxed);
+    g_overlay_latest_cached.store(0, std::memory_order_relaxed);
+    g_overlay_latest_binding.store(0, std::memory_order_relaxed);
+    g_overlay_latest_lock_retained.store(0, std::memory_order_relaxed);
+    g_overlay_latest_layer.store(0, std::memory_order_relaxed);
+    g_overlay_latest_param_slot.store(0xFFFFFFFFu, std::memory_order_relaxed);
+    g_overlay_latest_root_slot.store(0xFFFFFFFFu, std::memory_order_relaxed);
+    g_overlay_latest_srv_slot.store(0xFFFFFFFFu, std::memory_order_relaxed);
+    g_overlay_latest_field_base.store(0, std::memory_order_relaxed);
+    g_overlay_latest_field_off.store(0, std::memory_order_relaxed);
+    g_overlay_latest_field_qword.store(0, std::memory_order_relaxed);
+    g_overlay_latest_flush_state.store(0, std::memory_order_relaxed);
+
+    spdlog::info("[FH5UIR] invalidated backbuffer-derived HUD/eye resource caches");
+}
+
 void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain) {
     if (!device || !swapchain) return;
     SetUiRedirectDevice(device);
@@ -3347,6 +3562,7 @@ void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain) {
 void ui_redirect_on_present() {
     static uint64_t s_last_log = 0;
     static uint64_t s_last_redirects = 0;
+    g_present_frame.fetch_add(1, std::memory_order_relaxed);    // frame boundary: pre/post UI snapshots stamp this so the HUD delta only pairs same-frame copies
     g_ui_lineage_frame.fetch_add(1, std::memory_order_relaxed);
     g_uir_cleared.store(false, std::memory_order_relaxed);          // re-clear the UI RT next frame
     g_uir_after_composite.store(false, std::memory_order_relaxed);  // reset the frame phase
@@ -3772,8 +3988,9 @@ void ui_redirect_on_present() {
             ID3D12Resource* latest = g_preui_eye_latest.load(std::memory_order_relaxed);
             uint32_t pw = 0, ph = 0, pf = 0;
             unpack_meta(g_preui_eye_latest_meta.load(std::memory_order_relaxed), pw, ph, pf);
-            spdlog::info("[FH5PREUI] captures={} recreated={} failed={} latest=0x{:X}[{}x{} f{}] frame={}",
+            spdlog::info("[FH5PREUI] preCaptures={} postCaptures={} recreated={} failed={} latest=0x{:X}[{}x{} f{}] frame={}",
                          g_dbg_preui_captures.exchange(0, std::memory_order_relaxed),
+                         g_dbg_postui_captures.exchange(0, std::memory_order_relaxed),
                          g_dbg_preui_recreated.exchange(0, std::memory_order_relaxed),
                          g_dbg_preui_failed.exchange(0, std::memory_order_relaxed),
                          reinterpret_cast<uintptr_t>(latest), pw, ph, pf,
@@ -3920,7 +4137,8 @@ ID3D12Resource* pre_ui_eye_candidate(uint32_t* out_w, uint32_t* out_h, uint32_t*
 ID3D12Resource* pre_ui_eye_candidate_for(ID3D12Resource* eye_texture,
                                          uint32_t* out_w,
                                          uint32_t* out_h,
-                                         uint32_t* out_fmt) {
+                                         uint32_t* out_fmt,
+                                         uint32_t max_age_ms) {
     ID3D12Resource* candidate = nullptr;
     uint64_t meta = 0;
     const uint64_t now_ms = GetTickCount64();
@@ -3929,7 +4147,7 @@ ID3D12Resource* pre_ui_eye_candidate_for(ID3D12Resource* eye_texture,
         for (auto& slot : g_preui_eye_slots) {
             if (slot.src != eye_texture || slot.copy == nullptr) continue;
             const uint64_t seen_ms = slot.seen_ms.load(std::memory_order_relaxed);
-            if (seen_ms != 0 && now_ms - seen_ms <= 2000) {
+            if (seen_ms != 0 && now_ms - seen_ms <= max_age_ms) {
                 candidate = slot.copy;
                 meta = slot.meta;
             }
@@ -3944,6 +4162,78 @@ ID3D12Resource* pre_ui_eye_candidate_for(ID3D12Resource* eye_texture,
         if (out_fmt) *out_fmt = f;
     }
     return candidate;
+}
+
+// FRAME-EXACT base for the live-final HUD delta: returns the pre-UI (clean world) snapshot for eye_texture ONLY
+// when it was captured in the frame currently being presented (pre_frame == want_frame). Pairs with the LIVE
+// backbuffer read (which already holds THIS frame's world+UI) => same backbuffer, same frame => the world cancels
+// exactly => delta = clean UI, no rotating-world residual. Rejects stale snapshots (the flicker) => caller holds
+// last instead. No command-list recording on the game's threads (unlike the post-UI snapshot path) => safe.
+ID3D12Resource* pre_ui_base_frame_matched(ID3D12Resource* eye_texture, uint64_t want_frame,
+                                          uint32_t* out_w, uint32_t* out_h, uint32_t* out_fmt) {
+    ID3D12Resource* candidate = nullptr;
+    uint64_t meta = 0;
+    {
+        std::scoped_lock lk(g_preui_eye_mtx);
+        for (auto& slot : g_preui_eye_slots) {
+            if (slot.src != eye_texture || slot.copy == nullptr) continue;
+            if (slot.seen_ms.load(std::memory_order_relaxed) != 0 &&
+                slot.pre_frame.load(std::memory_order_relaxed) == want_frame) {
+                candidate = slot.copy;
+                meta = slot.meta;
+            }
+            break;
+        }
+    }
+    if (out_w || out_h || out_fmt) {
+        uint32_t w = 0, h = 0, f = 0;
+        unpack_meta(candidate ? meta : 0, w, h, f);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_fmt) *out_fmt = f;
+    }
+    return candidate;
+}
+
+// DUAL-SNAPSHOT pair for the HUD delta: returns the slot's (pre-UI clean world = base) and (post-UI world+UI =
+// final) copies for eye_texture ONLY when both are from the SAME frame (pre_frame==post_frame) and fresh. Both are
+// GPU-ordered snapshots on the game's command list => the world cancels exactly in final-base => clean UI, no
+// rotating-world residual (the flicker). Returns true on a valid same-frame pair; out_final/out_base both PSR.
+bool pre_ui_delta_pair(ID3D12Resource* eye_texture,
+                       ID3D12Resource** out_final, ID3D12Resource** out_base,
+                       uint32_t* out_w, uint32_t* out_h, uint32_t* out_fmt,
+                       uint32_t max_age_ms) {
+    ID3D12Resource* base = nullptr;
+    ID3D12Resource* final_c = nullptr;
+    uint64_t meta = 0;
+    const uint64_t now_ms = GetTickCount64();
+    {
+        std::scoped_lock lk(g_preui_eye_mtx);
+        for (auto& slot : g_preui_eye_slots) {
+            if (slot.src != eye_texture || slot.copy == nullptr || slot.post_copy == nullptr) continue;
+            const uint64_t pre_ms  = slot.seen_ms.load(std::memory_order_relaxed);
+            const uint64_t post_ms = slot.post_seen_ms.load(std::memory_order_relaxed);
+            const uint64_t pf = slot.pre_frame.load(std::memory_order_relaxed);
+            const uint64_t qf = slot.post_frame.load(std::memory_order_relaxed);
+            if (pre_ms != 0 && post_ms != 0 && pf != 0 && pf == qf &&
+                now_ms - pre_ms <= max_age_ms && now_ms - post_ms <= max_age_ms) {
+                base = slot.copy;
+                final_c = slot.post_copy;
+                meta = slot.meta;
+            }
+            break;
+        }
+    }
+    if (out_final) *out_final = final_c;
+    if (out_base)  *out_base  = base;
+    if (out_w || out_h || out_fmt) {
+        uint32_t w = 0, h = 0, f = 0;
+        unpack_meta((base && final_c) ? meta : 0, w, h, f);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        if (out_fmt) *out_fmt = f;
+    }
+    return base != nullptr && final_c != nullptr;
 }
 
 ID3D12Resource* overlay_srv_candidate(D3D12_CPU_DESCRIPTOR_HANDLE* out_srv,
@@ -4117,11 +4407,19 @@ void enter_ui_pass() {
     g_ui_pass_depth.fetch_add(1, std::memory_order_acq_rel);
 }
 void leave_ui_pass() {
+    const bool outermost = (t_ui_pass_depth == 1);
     if (t_ui_pass_depth > 0) {
         --t_ui_pass_depth;
     }
     int depth = g_ui_pass_depth.load(std::memory_order_acquire);
     while (depth > 0 && !g_ui_pass_depth.compare_exchange_weak(depth, depth - 1, std::memory_order_acq_rel)) {
+    }
+    // On the OUTERMOST bracket close (all UI drawn this frame), snapshot the post-UI backbuffer onto the same
+    // recording list (t_ui_cmdlist) so it pairs with the pre-UI clean-world snapshot for a same-frame delta.
+    if (outermost && t_ui_cmdlist != nullptr) {
+        ID3D12GraphicsCommandList* list = t_ui_cmdlist;
+        t_ui_cmdlist = nullptr;
+        __try { CapturePostUiEyeOnList(list); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 }
 bool in_ui_pass()    { return t_ui_pass_depth > 0 || g_ui_pass_depth.load(std::memory_order_acquire) > 0; }
@@ -4563,6 +4861,7 @@ bool  ctl_hud_quad()    { return g_ctl_hud_quad.load(std::memory_order_relaxed);
 bool  ctl_hud_opaque()  { return g_ctl_hud_opaque.load(std::memory_order_relaxed); }
 bool  ctl_hud_premul()  { return g_ctl_hud_premul.load(std::memory_order_relaxed); }
 bool  ctl_hud_flipv()   { return g_ctl_hud_flipv.load(std::memory_order_relaxed); }
+bool  ctl_both_eyes()   { return g_ctl_both_eyes.load(std::memory_order_relaxed); }
 int   ctl_hud_phase()   { return g_ctl_hud_phase.load(std::memory_order_relaxed) ? 1 : 0; }
 float ctl_hud_w()       { return g_ctl_hud_w.load(std::memory_order_relaxed); }
 float ctl_hud_x()       { return g_ctl_hud_x.load(std::memory_order_relaxed); }
@@ -4571,6 +4870,8 @@ float ctl_hud_z()       { return g_ctl_hud_z.load(std::memory_order_relaxed); }
 bool  ctl_ui_redirect() { return g_ctl_ui_redirect.load(std::memory_order_relaxed) != 0; }
 int   ctl_ui_redirect_mode() { return g_ctl_ui_redirect.load(std::memory_order_relaxed); }
 int   ctl_hud_plane()   { return g_ctl_hud_plane.load(std::memory_order_relaxed); }
+int   ctl_hud_dump_seq(){ return g_ctl_hud_dump_seq.load(std::memory_order_relaxed); }
+uint64_t present_frame() { return g_present_frame.load(std::memory_order_relaxed); }
 const char* pos_lane_name(int lane) {
     switch (lane) {
     case kPosLaneCcam320: return "ccam320";

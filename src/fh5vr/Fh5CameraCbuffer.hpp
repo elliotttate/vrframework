@@ -50,6 +50,7 @@ void ui_redirect_install(ID3D12Device* device, IDXGISwapChain* swapchain);
 void ui_redirect_on_present();          // reset the per-frame backbuffer-bind counter (once per present)
 ID3D12Resource* ui_redirect_target();   // UI-only RT (alpha) for the quad this frame; nullptr if inactive
 bool ui_redirect_active();              // redirect on + installed + UI RT valid
+void invalidate_backbuffer_resources(); // drop compare-only/backbuffer-derived resource caches on swapchain reset
 
 // vf54 UI-pass bracket (engine-level, scene-independent). The UIRenderer (D3D12UIRenderer) per-frame render
 // entry = vtable slot 54 (EA 0x14181FCB0); Fh5Adapter inline-hooks it and calls enter/leave around the call.
@@ -89,10 +90,24 @@ ID3D12Resource* hud_plane(int idx);
 ID3D12Resource* ui_lineage_candidate();
 ID3D12Resource* ui_atlas_candidate(uint32_t* out_w = nullptr, uint32_t* out_h = nullptr, uint32_t* out_fmt = nullptr);
 ID3D12Resource* pre_ui_eye_candidate(uint32_t* out_w = nullptr, uint32_t* out_h = nullptr, uint32_t* out_fmt = nullptr);
+// max_age_ms gates freshness: the eye projection tolerates a slightly-stale clean-world snapshot (default
+// 2000ms = mild judder), but the HUD DELTA base must be THIS frame's snapshot (~33ms) or final-base is a
+// different world -> a blown-out world-residual delta that makes the drawn HUD flicker on/off.
 ID3D12Resource* pre_ui_eye_candidate_for(ID3D12Resource* eye_texture,
                                          uint32_t* out_w = nullptr,
                                          uint32_t* out_h = nullptr,
-                                         uint32_t* out_fmt = nullptr);
+                                         uint32_t* out_fmt = nullptr,
+                                         uint32_t max_age_ms = 2000);
+// Same-frame (pre-UI clean world, post-UI world+UI) snapshot pair for the flicker-free HUD delta.
+bool pre_ui_delta_pair(ID3D12Resource* eye_texture,
+                       ID3D12Resource** out_final, ID3D12Resource** out_base,
+                       uint32_t* out_w = nullptr, uint32_t* out_h = nullptr, uint32_t* out_fmt = nullptr,
+                       uint32_t max_age_ms = 200);
+// Frame-exact pre-UI (clean world) snapshot for eye_texture, matched to the frame being presented (present_frame()).
+ID3D12Resource* pre_ui_base_frame_matched(ID3D12Resource* eye_texture, uint64_t want_frame,
+                                          uint32_t* out_w = nullptr, uint32_t* out_h = nullptr,
+                                          uint32_t* out_fmt = nullptr);
+uint64_t present_frame();
 ID3D12Resource* overlay_srv_candidate(D3D12_CPU_DESCRIPTOR_HANDLE* out_srv = nullptr,
                                       uint32_t* out_w = nullptr, uint32_t* out_h = nullptr,
                                       uint32_t* out_fmt = nullptr);
@@ -105,6 +120,7 @@ ID3D12Resource* ui_final_mirror_candidate(uint32_t* out_w = nullptr, uint32_t* o
 ID3D12Resource* ui_final_sample_candidate(uint32_t* out_w = nullptr, uint32_t* out_h = nullptr, uint32_t* out_fmt = nullptr);
 int hud_plane_count();
 int ctl_hud_plane();   // hudplane=N control: which display-plane index to show on the quad (-1=auto/last)
+int ctl_hud_dump_seq();// huddump=N control: re-arm the HUD-quad base/final/diff one-shot dump (write increasing N to grab a fresh gameplay capture)
 
 // Diagnostics for the FH5VR.log heartbeat.
 unsigned long long ring_writes();
@@ -142,6 +158,7 @@ bool ctl_hud_quad();    // submit the UI/HUD as a head-locked OpenXR quad layer 
 bool ctl_hud_opaque();  // hudopaque=on -> opaque quad (no source-alpha blend)
 bool ctl_hud_premul();  // hudpremul=on -> quad source is premultiplied alpha (default); off -> straight (sets XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
 bool ctl_hud_flipv();   // hudflipv=on -> flip the quad source vertically in the HUD blit (for runtimes with inverted quad-layer V; e.g. SimXR preview)
+bool ctl_both_eyes();   // botheyes=on -> copy the fresh frame to BOTH eye swapchains each present (mono; kills stale-eye flicker from FH5's imbalanced per-eye AFR)
 int  ctl_hud_phase();   // hudphase=left/right -> which AER phase refreshes the HUD quad source
 float ctl_hud_w();      // quad width (metres); height from texture aspect
 float ctl_hud_x();      // quad centre offset in view space (metres): +x right
