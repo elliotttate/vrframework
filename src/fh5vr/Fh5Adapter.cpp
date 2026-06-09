@@ -1583,8 +1583,10 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     const float* driver_delta =
         (rot_mode == 2 || rot_mode == 3 || rot_mode == 4 || rot_mode == 5) ? head_delta16 : identity16;
     std::memcpy(s.delta, producer_delta, sizeof(s.delta));
-    const glm::vec3 head_right_axis{ head_delta16[0], head_delta16[1], head_delta16[2] };
-    const glm::vec3 driver_off_full = s_head_off_driver + head_right_axis * half_ipd;
+    // Do not publish per-eye IPD into the shared camera-object data path. The retail data worker consumes
+    // driver_off as physical 6DOF head translation; mixing in a rotated right-eye vector makes pure yaw/pitch
+    // look like forward/up movement. IPD stays in the per-eye cbuffer/projection path only.
+    const glm::vec3 driver_off_full = s_head_off_driver;
     const glm::vec3 driver_off = upstream_position ? driver_off_full : glm::vec3{ 0.0f };
     const float delta9[9]{
         driver_delta[0], driver_delta[1], driver_delta[2],

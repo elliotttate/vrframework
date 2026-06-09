@@ -24,6 +24,17 @@ param(
     [switch]$RealRuntime,
     [switch]$SkipDeploy,
     [switch]$SkipNavigate,
+    [string]$ControlPath = "E:\tmp\fh5vr_ctl.txt",
+    [Alias("Scale")]
+    [float]$WorldScale = 1.0,
+    [Alias("Ipd")]
+    [float]$HalfIpdUnits = 0.032,
+    [ValidateSet("ypr540","driver","angle","freelook","a4","off")]
+    [string]$RotationPath = "ypr540",
+    [ValidateSet("camsrc","proda15","input540","viewtail","ccam320","ccam320_d550","clone0","clone1","clone2","downstream","off")]
+    [string]$PosLane = "camsrc",
+    [ValidateSet("on","off")]
+    [string]$Projection = "off",
     [int]$TitleWaitSec        = 50,   # boot -> title screen
     [int]$AfterStartGameSec   = 6,    # title START GAME -> Continue menu
     [int]$AfterContinueSec    = 22,   # Continue -> save load -> Garage
@@ -44,6 +55,14 @@ if (-not $SkipDeploy) {
     Copy-Item $BuildDll (Join-Path $GameDir "version.dll") -Force
     Write-Output "DEPLOY version.dll <- $BuildDll"
 }
+
+# Keep stale Empress/debug ctl files from putting Steam retail back on inert producer lanes.
+$controlDir = Split-Path -Parent $ControlPath
+if ($controlDir) { New-Item -ItemType Directory -Path $controlDir -Force | Out-Null }
+$recenter = [int][double]::Parse((Get-Date -UFormat %s), [Globalization.CultureInfo]::InvariantCulture)
+$control = "ipd=$HalfIpdUnits`nscale=$WorldScale`nmode=off`nrot=$RotationPath`nproj=$Projection`nposlane=$PosLane`ntgt=off`nfwd=0`nstrafe=0`nup=0`nrecenter=$recenter`nuiredirect=0`nhudquad=off`nhudopaque=off`nhudpremul=on`nhudflipv=on`nbotheyes=off"
+[System.IO.File]::WriteAllText($ControlPath, $control, [System.Text.Encoding]::ASCII)
+Write-Output "CONTROL $ControlPath ipd=$HalfIpdUnits scale=$WorldScale mode=off rot=$RotationPath proj=$Projection poslane=$PosLane tgt=off"
 
 # 1) runtime env inherited by the child
 if (-not $RealRuntime) {

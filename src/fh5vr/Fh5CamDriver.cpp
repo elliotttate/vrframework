@@ -3093,6 +3093,13 @@ static Matrix4 MulRowVector(const Matrix4& d, const Matrix4& m) {
     return r;
 }
 
+static int Retail1688EffectivePosLane() {
+    const int lane = fh5cb::ctl_pos_lane();
+    // Steam retail has no producer hook path. Preserve the Empress default globally, but keep direct retail
+    // launches from silently selecting a lane this worker cannot consume.
+    return lane == fh5cb::kPosLaneProducerA15 ? fh5cb::kPosLaneCamSrc : lane;
+}
+
 bool apply_camdriver_head_rotation(uintptr_t object) {
     if (object < 0x10000ull) return false;
     // Mode 2 ONLY (rot=driver). In mode 3 (rot=angle) the head-look is injected at the orientation angles
@@ -3227,11 +3234,10 @@ uintptr_t ScanForCamera1688() {
 
 void Tick1688DataHeadlook() {
     if (!IsRetail1688Build()) return;
-    if (fh5cb::ctl_rotation_mode() == 0) return;   // rot=off
 
     // (a) Lock the active camera, then cache it. STABILITY: the region scan memcpy's up to ~768MB; running it
     // repeatedly during FH5's fragile boot/load phase hung the game at ~0fps (only ~10 presents in 43 min). So:
-    //   * never scan during the first 90s of mod uptime (the boot/load window — no gameplay camera exists yet),
+    //   * never scan during the first 130s of mod uptime (the retail launcher needs ~100s to reach free-roam),
     //   * scan at most every 12s while uncached,
     //   * once locked, NEVER re-scan unless Cam1688Valid fails continuously for >30s (handles a real scene
     //     camera move without re-scanning on transient gate flicker).
@@ -3248,7 +3254,7 @@ void Tick1688DataHeadlook() {
         }
     }
     if (g_dc_camera == 0) {
-        if (now - s_worker_start_ms < 90000) return;   // skip the fragile boot/load window entirely
+        if (now - s_worker_start_ms < 130000) return;  // skip the fragile boot/load window entirely
         if (now - g_dc_last_scan_ms < 12000) return;
         g_dc_last_scan_ms = now;
         const uintptr_t found = ScanForCamera1688();
@@ -3259,33 +3265,56 @@ void Tick1688DataHeadlook() {
     }
     const uintptr_t cam = g_dc_camera;
     const int rotmode = fh5cb::ctl_rotation_mode();
+    const int requested_poslane = fh5cb::ctl_pos_lane();
+    const int poslane = Retail1688EffectivePosLane();
 
-    // (c) Head-look. Several no-.text-hook levers, switchable LIVE via the ctl file (rot=...):
-    //   rot=angle (3): inject head Euler at cam+0x90/94/98 — the proven Empress lever. INERT on retail: the
-    //                  +0x31C/+0x320-scan camera is a look-at camera with no radian Euler at +0x90 (bails).
-    //   rot=freelook (4): write the engine's NATIVE cockpit free-look angles +0x5C4 yaw / +0x5F4 pitch / +0x5F8
-    //                     roll (consumed during the engine's own camera build -> view+cull+cascades coherent).
-    //   rot=ypr540 (5): write the +0x540 CameraSpaceYPR input lane (tag=0 + pitch/yaw/roll).
-    // The +0x90 lever rebuilds +0x320 from the angles, so it also keeps a +0x320 matrix fallback for frames the
-    // engine doesn't rebuild. The freelook/ypr540 levers write engine input fields and need no matrix fallback.
+    // (c) Retail no-.text-hook 6DOF. The +0x540 "YPR" lane proved visually positional on Steam, so the
+    // shipping retail path writes the active camera's +0x320 matrix directly:
+    //   * rows 0-2: head-rotated basis for look
+    //   * row 3: physical/manual camera-space offset for position
+    // It composes onto the engine-refreshed base every tick, so there is no accumulation.
     bool angle_applied = false, fl_applied = false, ypr_applied = false;
-    if      (rotmode == 3) angle_applied = apply_angle_head_rotation_prewrite(cam);
-    else if (rotmode == 4) fl_applied    = apply_freelook_headlook_1688(cam);
-    else if (rotmode == 5) ypr_applied   = apply_ypr540_headlook_1688(cam);
+    bool matrix_applied = false, pos_applied = false;
+    if (rotmode == 4) {
+        fl_applied = apply_freelook_headlook_1688(cam);
+    }
 
     float s = 0, u = 0, f = 0; Pose delta{}; int eye = 0;
-    if (rotmode == 3 && !angle_applied && SnapshotOpenXrPose(s, u, f, delta, eye)) {   // +0x320 fallback ONLY if +0x90 didn't take
-        Matrix4 cur{};
-        if (Cam320IsOrthonormal(cam, cur)) {
-            if (g_dc_base_obj != cam) { g_dc_base_obj = cam; g_dc_base = cur; }
-            else if (!MatricesClose16(cur, g_dc_written, 1e-3f)) { g_dc_base = cur; }
+    const bool pose_ok_now = SnapshotOpenXrPose(s, u, f, delta, eye);
+    Matrix4 cur{};
+    if (pose_ok_now && Cam320IsOrthonormal(cam, cur)) {
+        if (g_dc_base_obj != cam) {
+            g_dc_base_obj = cam;
+            g_dc_base = cur;
+        } else if (!MatricesClose16(cur, g_dc_written, 1e-3f)) {
+            g_dc_base = cur;
+        }
+
+        Matrix4 out = g_dc_base;
+        if (rotmode == 2 || rotmode == 3 || rotmode == 5) {
             Matrix4 rot{};
             rot.m[0]=delta.right.x;   rot.m[1]=delta.right.y;   rot.m[2]=delta.right.z;   rot.m[3]=0.0f;
             rot.m[4]=delta.up.x;      rot.m[5]=delta.up.y;      rot.m[6]=delta.up.z;      rot.m[7]=0.0f;
             rot.m[8]=delta.forward.x; rot.m[9]=delta.forward.y; rot.m[10]=delta.forward.z;rot.m[11]=0.0f;
             rot.m[12]=0.0f;           rot.m[13]=0.0f;           rot.m[14]=0.0f;           rot.m[15]=1.0f;
-            const Matrix4 out = MulRowVector(rot, g_dc_base);
-            if (SafeCopyOut(cam + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) g_dc_written = out;
+            out = MulRowVector(rot, g_dc_base);
+            matrix_applied = true;
+        }
+
+        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+        if (poslane == fh5cb::kPosLaneCamSrc && current_local_offset(lx, ly, lz)) {
+            const float* b = out.m.data();
+            out.m[12] = g_dc_base.m[12] + lx * b[0] + ly * b[4] + lz * b[8];
+            out.m[13] = g_dc_base.m[13] + lx * b[1] + ly * b[5] + lz * b[9];
+            out.m[14] = g_dc_base.m[14] + lx * b[2] + ly * b[6] + lz * b[10];
+            pos_applied = true;
+        }
+
+        if ((matrix_applied || pos_applied) &&
+            SafeCopyOut(cam + kCameraMatrixOffset, out.m.data(), sizeof(float) * out.m.size())) {
+            g_dc_written = out;
+            if (rotmode == 3) angle_applied = matrix_applied;
+            if (rotmode == 5) ypr_applied = matrix_applied;
         }
     }
 
@@ -3295,9 +3324,22 @@ void Tick1688DataHeadlook() {
             float p_s=0,p_u=0,p_f=0; Pose p_d{}; int p_e=0;
             const bool poseOk = SnapshotOpenXrPose(p_s,p_u,p_f,p_d,p_e);
             float a90=0,a94=0,a98=0; SafeRead(cam+0x90,a90); SafeRead(cam+0x94,a94); SafeRead(cam+0x98,a98);
-            spdlog::info("[FH5DATACAM] cam=0x{:X} applied(ang/fl/ypr)={}/{}/{} | rotMode={} poslane={} poseOk={} | cam90/94/98=({:.3f},{:.3f},{:.3f})",
+            float hy = 0.0f, hp = 0.0f, hr = 0.0f;
+            if (poseOk) {
+                float fy = p_d.forward.y;
+                if (fy > 1.0f) fy = 1.0f;
+                if (fy < -1.0f) fy = -1.0f;
+                hy = std::atan2(p_d.forward.x, p_d.forward.z);
+                hp = std::asin(fy);
+                hr = std::atan2(p_d.right.y, p_d.up.y);
+            }
+            spdlog::info("[FH5DATACAM] cam=0x{:X} applied(ang/fl/ypr/mat/pos)={}/{}/{}/{}/{} | rotMode={} poslane={}=>{} poseOk={} head(y,p,r)=({:.3f},{:.3f},{:.3f}) row3=({:.3f},{:.3f},{:.3f}) | cam90/94/98=({:.3f},{:.3f},{:.3f})",
                          cam, angle_applied?1:0, fl_applied?1:0, ypr_applied?1:0,
-                         rotmode, fh5cb::ctl_pos_lane(), poseOk ? 1 : 0, a90, a94, a98);
+                         matrix_applied?1:0, pos_applied?1:0,
+                         rotmode, requested_poslane, poslane, poseOk ? 1 : 0,
+                         hy, hp, hr,
+                         g_dc_written.m[12], g_dc_written.m[13], g_dc_written.m[14],
+                         a90, a94, a98);
             // Read-only dump of the native cockpit free-look + CameraSpaceYPR lever fields, so we can SEE which
             // are plausible angle fields on this retail camera object (small radians / a tag dword) vs garbage —
             // this picks the working lever without a rebuild (just flip rot= in the ctl file).
