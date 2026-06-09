@@ -1331,9 +1331,11 @@ bool D3D12Component::on_frame(VR* vr) {
     const uint64_t now_for_eye_ms = ::GetTickCount64();
     const uint64_t applied_eye_ms = fh5diag::applied_eye_ms();
     const bool producer_eye_fresh = applied_eye_ms != 0 && (now_for_eye_ms - applied_eye_ms) <= 250;
+    static std::atomic<uint32_t> s_fallback_eye_seq{ 0 };
+    const int fallback_eye = static_cast<int>(s_fallback_eye_seq.fetch_add(1, std::memory_order_relaxed) & 1u);
     const int applied_eye = producer_eye_fresh
         ? fh5diag::applied_eye()
-        : (int)vr->get_current_render_eye();   // 0=LEFT, 1=RIGHT
+        : fallback_eye;   // no fresh producer stamp on Steam retail -> feed XR eyes as a strict L/R pair
 
     // Diagnostic: log densely during startup/reset, then at low rate. This proves whether the producer eye,
     // copy eye, backbuffer index, and XR begin/end state are paired instead of only sampling one line/5s.
@@ -1346,8 +1348,9 @@ bool D3D12Component::on_frame(VR* vr) {
         uint64_t last_ms = s_last_log_ms.load(std::memory_order_relaxed);
         if ((copy_seq < 120 || now_ms - last_ms >= 1000) &&
             s_last_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
-            spdlog::info("[VR-COPY] present#{} eye={} src={} bbIdx={} began={} synced={} shouldRender={}",
-                copy_seq, applied_eye, producer_eye_fresh ? "producer" : "parity",
+            spdlog::info("[VR-COPY] present#{} eye={} src={} fallback={} bbIdx={} began={} synced={} shouldRender={}",
+                copy_seq, applied_eye, producer_eye_fresh ? "producer" : "local",
+                fallback_eye,
                 backbuffer_index,
                 vr->m_openxr->frame_began ? 1 : 0,
                 vr->m_openxr->frame_synced ? 1 : 0,

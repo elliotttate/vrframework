@@ -29,10 +29,12 @@ param(
     [float]$WorldScale = 1.0,
     [Alias("Ipd")]
     [float]$HalfIpdUnits = 0.032,
-    [ValidateSet("ypr540","driver","angle","freelook","a4","off")]
-    [string]$RotationPath = "ypr540",
+    [ValidateSet("freelook","ypr540","driver","angle","a4","off")]
+    [string]$RotationPath = "freelook",
     [ValidateSet("camsrc","proda15","input540","viewtail","ccam320","ccam320_d550","clone0","clone1","clone2","downstream","off")]
     [string]$PosLane = "camsrc",
+    [ValidateSet("all","camrel","viewvp","off")]
+    [string]$CBufferMode = "all",
     [ValidateSet("on","off")]
     [string]$Projection = "off",
     [int]$TitleWaitSec        = 50,   # boot -> title screen
@@ -62,7 +64,28 @@ if ($controlDir) { New-Item -ItemType Directory -Path $controlDir -Force | Out-N
 $recenter = [int][double]::Parse((Get-Date -UFormat %s), [Globalization.CultureInfo]::InvariantCulture)
 $control = "ipd=$HalfIpdUnits`nscale=$WorldScale`nmode=off`nrot=$RotationPath`nproj=$Projection`nposlane=$PosLane`ntgt=off`nfwd=0`nstrafe=0`nup=0`nrecenter=$recenter`nuiredirect=0`nhudquad=off`nhudopaque=off`nhudpremul=on`nhudflipv=on`nbotheyes=off"
 [System.IO.File]::WriteAllText($ControlPath, $control, [System.Text.Encoding]::ASCII)
-Write-Output "CONTROL $ControlPath ipd=$HalfIpdUnits scale=$WorldScale mode=off rot=$RotationPath proj=$Projection poslane=$PosLane tgt=off"
+Write-Output "CONTROL $ControlPath ipd=$HalfIpdUnits scale=$WorldScale mode=off->${CBufferMode} rot=$RotationPath proj=$Projection poslane=$PosLane tgt=off"
+
+function Set-ControlValue([string]$Key, [string]$Value) {
+    if (-not (Test-Path $ControlPath)) { return }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $seen = $false
+    foreach ($line in [IO.File]::ReadAllLines($ControlPath)) {
+        if ($line.StartsWith("$Key=")) {
+            $lines.Add("$Key=$Value")
+            $seen = $true
+        } else {
+            $lines.Add($line)
+        }
+    }
+    if (-not $seen) { $lines.Add("$Key=$Value") }
+    [IO.File]::WriteAllLines($ControlPath, $lines, [Text.Encoding]::ASCII)
+}
+
+function Has-VRCopyLog() {
+    if (-not (Test-Path $log)) { return $false }
+    return [bool](Select-String -Path $log -SimpleMatch "[VR-COPY]" -Quiet)
+}
 
 # 1) runtime env inherited by the child
 if (-not $RealRuntime) {
@@ -85,9 +108,28 @@ while ((Get-Date) -lt $dl -and -not (Test-Path $log)) { Start-Sleep -Millisecond
 if (-not (Test-Path $log)) { Write-Output "RESULT=NO_LOG (proxy didn't load)"; exit 1 }
 Write-Output "FH5VR.log up; waiting ${TitleWaitSec}s for the title screen"
 Start-Sleep -Seconds $TitleWaitSec
+if (-not (Has-VRCopyLog)) {
+    Write-Output "BOOT_RETRY no [VR-COPY] after ${TitleWaitSec}s; relaunching once"
+    Get-Process -Id $g.Id -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 5
+    if (Test-Path $log) { Remove-Item $log -Force -ErrorAction SilentlyContinue }
+    $g = Start-Process -FilePath $exe -WorkingDirectory $GameDir -PassThru
+    Write-Output ("RELAUNCHED pid={0} ({1})" -f $g.Id, (Get-Date -Format HH:mm:ss))
+    $dl = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $dl -and -not (Test-Path $log)) { Start-Sleep -Milliseconds 500 }
+    if (-not (Test-Path $log)) { Write-Output "RESULT=NO_LOG_AFTER_RETRY (proxy didn't load)"; exit 1 }
+    Write-Output "FH5VR.log up after retry; waiting ${TitleWaitSec}s for the title screen"
+    Start-Sleep -Seconds $TitleWaitSec
+    if (-not (Has-VRCopyLog)) { Write-Output "RESULT=NO_VR_COPY_AFTER_RETRY"; exit 1 }
+}
 if (-not (Get-Process -Id $g.Id -ErrorAction SilentlyContinue)) { Write-Output "RESULT=EXITED_DURING_BOOT"; exit 1 }
 
-if ($SkipNavigate) { Write-Output "RESULT=READY (title; -SkipNavigate)"; exit 0 }
+if ($SkipNavigate) {
+    Set-ControlValue "mode" $CBufferMode
+    Write-Output "CBUFFER mode=$CBufferMode"
+    Write-Output "RESULT=READY (title; -SkipNavigate)"
+    exit 0
+}
 
 # 3) navigate the retail menu flow via the class-"App" game window (FH5Window.ps1)
 function Key([byte]$vk, [string]$label) {
@@ -99,6 +141,9 @@ Key 0x28 "Down"; Start-Sleep -Milliseconds 400
 Key 0x26 "Up";   Start-Sleep -Milliseconds 400
 Key 0x0D "Enter (Continue -> load -> Garage)";  Start-Sleep -Seconds $AfterContinueSec
 Key 0x20 "Space (Drive -> free-roam)";          Start-Sleep -Seconds $AfterDriveSec
+
+Set-ControlValue "mode" $CBufferMode
+Write-Output "CBUFFER mode=$CBufferMode"
 
 $alive = [bool](Get-Process -Id $g.Id -ErrorAction SilentlyContinue)
 $datacam = if (Test-Path $log) { (Select-String -Path $log -SimpleMatch "FH5DATACAM] active camera" | Select-Object -Last 1) } else { $null }

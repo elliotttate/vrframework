@@ -429,6 +429,7 @@ bool SlotDone(uintptr_t a, uint64_t h) { std::lock_guard<std::mutex> lk(g_slot_m
 void SlotMark(uintptr_t a, uint64_t h) { std::lock_guard<std::mutex> lk(g_slot_mtx); g_slot_hash[a] = h; }
 
 std::atomic<uint64_t> g_ring_writes{ 0 }, g_cam_hits{ 0 };
+std::atomic<uint64_t> g_cbv6912{ 0 };   // count of 6912B CBVs seen by Hook_CBV
 
 // SEH-guarded transform of one resolved slot (the mapped ptr can dangle if its ring was freed). No C++
 // objects with destructors live in THIS frame (the helpers it calls own their own frames), so __try is legal.
@@ -441,7 +442,21 @@ bool TransformSlotSEH(uint8_t* p) {
         if (SlotDone(reinterpret_cast<uintptr_t>(p), h)) return false;   // already transformed this refill
         if (TransformStereo(p)) {
             SlotMark(reinterpret_cast<uintptr_t>(p), HashCam(p));
-            g_ring_writes.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t writes = g_ring_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            static std::atomic<uint64_t> s_last_write_log_ms{ 0 };
+            const uint64_t now_ms = ::GetTickCount64();
+            uint64_t last_ms = s_last_write_log_ms.load(std::memory_order_relaxed);
+            if ((writes <= 24 || now_ms - last_ms >= 1000) &&
+                s_last_write_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+                spdlog::info("[FH5CB] stereo cbuffer write#{} mode={} off=({:.4f},{:.4f},{:.4f}) cbv6912={} hits={}",
+                    writes,
+                    g_ctl_mode.load(std::memory_order_relaxed),
+                    g_off_x.load(std::memory_order_relaxed),
+                    g_off_y.load(std::memory_order_relaxed),
+                    g_off_z.load(std::memory_order_relaxed),
+                    g_cbv6912.load(std::memory_order_relaxed),
+                    g_cam_hits.load(std::memory_order_relaxed));
+            }
             return true;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -462,7 +477,6 @@ using FnCopyDescriptors = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const D3
 using FnCopyDescriptorsSimple = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
 
 std::unique_ptr<FunctionHook> g_hk_committed, g_hk_placed, g_hk_cbv, g_hk_srv, g_hk_uav, g_hk_copydesc, g_hk_copydesc_simple;
-std::atomic<uint64_t> g_cbv6912{ 0 };   // count of 6912B CBVs seen by Hook_CBV
 std::atomic<uint32_t> g_srv_inc{ 0 };    // CBV/SRV/UAV descriptor increment, set from the live device
 void ClearSrvHandle(size_t handle);      // defined after the lock-free SRV descriptor map
 

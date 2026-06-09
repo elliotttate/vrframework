@@ -1544,7 +1544,6 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     // true metre-scale diagnostics available.
     const float ipd_sign = (view.current_render_eye == StereoView::Eye::LEFT) ? -1.0f : 1.0f;
     const float half_ipd = ipd_sign * fh5cb::ctl_half_ipd() * ws;
-    const glm::vec3 cbuf_off = s_head_off_cbuf + glm::vec3(half_ipd, 0.0f, 0.0f);
 
     // Rotation path is live-selectable:
     //   rot=angle:           SHADOW-COHERENT (CAMERA_VR_FIX_GUIDE) — inject the head Euler at the rendered
@@ -1577,6 +1576,8 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
         pos_lane != fh5cb::kPosLaneDownstream &&
         pos_lane != fh5cb::kPosLaneOff;
     const bool downstream_position = pos_lane == fh5cb::kPosLaneDownstream;
+    const glm::vec3 ipd_off{ half_ipd, 0.0f, 0.0f };
+    const glm::vec3 cbuf_off = downstream_position ? (s_head_off_cbuf + ipd_off) : ipd_off;
     const float* producer_delta = (rot_mode == 1) ? head_delta16 : identity16;
     // driver_delta carries the head rotation for the data-worker rotation modes. The individual appliers
     // self-gate on ctl_rotation_mode(), so this can publish the same head basis for all driver/data levers.
@@ -1596,9 +1597,10 @@ void Fh5Adapter::apply_stereo(const StereoView& view) {
     fh5cam::publish_openxr_pose(driver_off.x, driver_off.y, driver_off.z, delta9, eye,
                                 pos_lane != fh5cb::kPosLaneOff);
 
-    // Downstream is now an explicit positive-control lane. It is not the final architecture, but it tells us
-    // whether the current simulator offset would be visible if the final camera cbuffer were patched.
-    fh5cb::set_eye_offset(cbuf_off.x, cbuf_off.y, cbuf_off.z, downstream_position);
+    // Keep upstream head translation on the selected camera-data lane, but always allow the final camera
+    // cbuffer to consume the per-eye IPD. Otherwise retail poslane=camsrc gets head motion but renders mono.
+    const bool cbuffer_position = downstream_position || std::fabs(half_ipd) > 0.000001f;
+    fh5cb::set_eye_offset(cbuf_off.x, cbuf_off.y, cbuf_off.z, cbuffer_position);
 
     {   // ~1/s diagnostic: head delta + per-eye offset
         static std::atomic<uint32_t> dcount{ 0 };
